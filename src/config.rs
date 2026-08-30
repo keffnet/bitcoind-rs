@@ -38,9 +38,10 @@ pub const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 100;
 pub const DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB: u64 = 3_000;
 pub const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
 pub const DEFAULT_MAX_TX_LEGACY_SIGOPS: u64 = 2_500;
-/// Core's default maximum serialized script/witness size accepted by relay
-/// policy. `-corepolicy` raises this soft default to the uint32 maximum.
-pub const DEFAULT_MAX_SCRIPT_SIZE_POLICY: u64 = 1_650;
+/// Maximum standard P2WSH witnessScript size in Core v31.1. The separate
+/// 1,650-byte ScriptSig limit is enforced directly by mempool policy.
+/// `-corepolicy` raises this soft default to the uint32 maximum.
+pub const DEFAULT_MAX_SCRIPT_SIZE_POLICY: u64 = 3_600;
 // Core v31.1 relays a standard OP_RETURN output up to the standard
 // transaction weight limit (400,000 WU / 4 = 100,000 vbytes). The full
 // script size, rather than only the pushed payload, is charged against this
@@ -886,18 +887,13 @@ impl PeerPermissionConfig {
         whitelist_relay: Option<bool>,
         whitelist_force_relay: bool,
         blocksonly: bool,
-        peer_bloom_filters: Option<bool>,
     ) -> Result<Self> {
-        let mut whitelist_values = whitelist.to_vec();
-        // Core keeps bloom-filter serving disabled globally by default, but
-        // grants localhost the implicit bloomfilter permission unless the
-        // option was explicitly set to false.
-        if peer_bloom_filters.is_none() {
-            whitelist_values.extend([
-                "in,out,bloomfilter@127.0.0.0/8".to_owned(),
-                "in,out,bloomfilter@::1/128".to_owned(),
-            ]);
-        }
+        // Core does not grant implicit permissions to localhost.  In
+        // particular, `-peerbloomfilters` controls both the advertised
+        // NODE_BLOOM service bit and the default BIP37 capability; a
+        // bloomfilter permission must be requested explicitly through
+        // `-whitelist`/`-whitebind` when the global option is disabled.
+        let whitelist_values = whitelist.to_vec();
         let whitelist = whitelist_values
             .iter()
             .map(|value| WhitelistRule::parse(value))
@@ -3944,7 +3940,6 @@ impl Config {
             args.whitelistrelay,
             args.whitelistforcerelay,
             args.blocksonly,
-            args.peer_bloom_filters,
         )?;
         let mut seen_bindings = HashSet::new();
         for address in p2p_binds

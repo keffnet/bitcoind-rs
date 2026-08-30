@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ios>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +21,16 @@ struct bitcoind_rs_utxo {
     const unsigned char* script_pubkey;
     unsigned int script_pubkey_len;
     std::int64_t value;
+};
+
+// Keep the parsed transaction and Core's transaction-wide sighash data alive
+// while individual inputs are checked by separate Rust worker tasks.  The
+// object is immutable after construction; VerifyScript only uses execution
+// state local to the input being checked.
+struct bitcoind_rs_script_context {
+    std::unique_ptr<CTransaction> transaction;
+    std::vector<CTxOut> outputs;
+    std::unique_ptr<PrecomputedTransactionData> txdata;
 };
 
 namespace {
@@ -51,6 +62,7 @@ public:
     }
 
     int GetVersion() const { return m_version; }
+    size_t Remaining() const { return m_remaining; }
 
 private:
     int m_version;
@@ -78,7 +90,10 @@ extern "C" int bitcoind_rs_verify_transaction_scripts(
     try {
         TxInputStream stream(PROTOCOL_VERSION, transaction_bytes, transaction_len);
         CTransaction transaction(deserialize, stream);
-        if (GetSerializeSize(transaction, PROTOCOL_VERSION) != transaction_len) {
+        // The bounded input stream already knows exactly how many bytes the
+        // transaction decoder consumed. Avoid serializing the whole
+        // transaction a second time merely to check for trailing bytes.
+        if (stream.Remaining() != 0) {
             return -1;
         }
         if (spent_outputs_len != transaction.vin.size() ||
@@ -131,6 +146,88 @@ extern "C" int bitcoind_rs_verify_transaction_scripts(
             }
         }
         return 1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+extern "C" bitcoind_rs_script_context* bitcoind_rs_create_script_context(
+    const unsigned char* transaction_bytes,
+    unsigned int transaction_len,
+    const bitcoind_rs_utxo* spent_outputs,
+    unsigned int spent_outputs_len,
+    unsigned int flags)
+{
+    if (transaction_bytes == nullptr && transaction_len != 0) {
+        return nullptr;
+    }
+
+    try {
+        auto context = std::make_unique<bitcoind_rs_script_context>();
+        TxInputStream stream(PROTOCOL_VERSION, transaction_bytes, transaction_len);
+        context->transaction = std::make_unique<CTransaction>(deserialize, stream);
+        if (stream.Remaining() != 0 ||
+            spent_outputs_len != context->transaction->vin.size() ||
+            (spent_outputs == nullptr && spent_outputs_len != 0)) {
+            return nullptr;
+        }
+
+        context->outputs.reserve(spent_outputs_len);
+        for (unsigned int index = 0; index < spent_outputs_len; ++index) {
+            const bitcoind_rs_utxo& spent = spent_outputs[index];
+            if (spent.script_pubkey == nullptr && spent.script_pubkey_len != 0) {
+                return nullptr;
+            }
+            context->outputs.emplace_back(
+                CAmount(spent.value),
+                CScript(spent.script_pubkey, spent.script_pubkey + spent.script_pubkey_len));
+        }
+
+        context->txdata = std::make_unique<PrecomputedTransactionData>(*context->transaction);
+        if ((flags & SCRIPT_VERIFY_TAPROOT) != 0) {
+            context->txdata->Init(*context->transaction, std::move(context->outputs));
+        }
+        return context.release();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" void bitcoind_rs_destroy_script_context(bitcoind_rs_script_context* context)
+{
+    delete context;
+}
+
+extern "C" int bitcoind_rs_verify_script_context_input(
+    const bitcoind_rs_script_context* context,
+    unsigned int input,
+    unsigned int flags)
+{
+    if (context == nullptr || context->transaction == nullptr || context->txdata == nullptr ||
+        input >= context->transaction->vin.size()) {
+        return -1;
+    }
+
+    try {
+        const CTxOut& output = context->txdata->m_spent_outputs_ready
+            ? context->txdata->m_spent_outputs[input]
+            : context->outputs[input];
+        TransactionSignatureChecker checker(
+            context->transaction.get(),
+            input,
+            output.nValue,
+            *context->txdata,
+            MissingDataBehavior::FAIL);
+        ScriptError error = SCRIPT_ERR_UNKNOWN_ERROR;
+        return VerifyScript(
+                   context->transaction->vin[input].scriptSig,
+                   output.scriptPubKey,
+                   &context->transaction->vin[input].scriptWitness,
+                   flags,
+                   checker,
+                   &error)
+            ? 1
+            : 0;
     } catch (...) {
         return -1;
     }

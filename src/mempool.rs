@@ -41,7 +41,6 @@ const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
 const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 /// Core's extra descendant count/size allowance for the single-tx CPFP
 /// carve-out. The size value is expressed in virtual bytes.
-const EXTRA_DESCENDANT_TX_SIZE_LIMIT: u64 = 10_000;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 const MAX_SCRIPT_SIZE: usize = 10_000;
 /// BIP 431/TRUC transaction version and topology limits.
@@ -627,6 +626,14 @@ pub enum MempoolError {
         count: usize,
         limit: usize,
     },
+    #[error(
+        "too many potential replacements, rejecting replacement {txid}; too many conflicting clusters ({count} > {limit})"
+    )]
+    TooManyConflictingClusters {
+        txid: Txid,
+        count: usize,
+        limit: usize,
+    },
     #[error("replacement transaction fee is too low")]
     ReplacementFee,
     #[error("{0}")]
@@ -637,8 +644,6 @@ pub enum MempoolError {
     ReplacementUnconfirmedInput,
     #[error("package RBF failed: package must be 1-parent-1-child")]
     PackageRbfWrongSize,
-    #[error("package RBF failed: {0}")]
-    PackageRbfConflictTopology(String),
     #[error("insufficient feerate: does not improve feerate diagram")]
     ReplacementFeerateDiagram,
     #[error("transaction {0} input is missing")]
@@ -704,7 +709,7 @@ impl MempoolError {
             Self::SameNonWitnessData(_) => "txn-same-nonwitness-data-in-mempool".to_owned(),
             Self::AlreadyInChain => "txn-already-known".to_owned(),
             Self::Conflict(_) => "txn-mempool-conflict".to_owned(),
-            Self::TooManyReplacementCandidates { .. } => {
+            Self::TooManyReplacementCandidates { .. } | Self::TooManyConflictingClusters { .. } => {
                 "too many potential replacements".to_owned()
             }
             Self::ReplacementFeerateDiagram => {
@@ -735,10 +740,7 @@ impl MempoolError {
             Self::NonStandard(reason) => reason.clone(),
             Self::ClusterLimit => "too-large-cluster".to_owned(),
             Self::MempoolLimits(_) => "too-long-mempool-chain".to_owned(),
-            Self::Truc(reason) => reason
-                .split_once(", ")
-                .map(|(code, _)| code.to_owned())
-                .unwrap_or_else(|| reason.clone()),
+            Self::Truc(_) => "TRUC-violation".to_owned(),
             Self::Script(reason) if reason == "transaction locktime is not yet satisfied" => {
                 "non-final".to_owned()
             }
@@ -753,8 +755,11 @@ impl MempoolError {
     }
 }
 
-fn truc_error(reason: &'static str, debug: String) -> MempoolError {
-    MempoolError::Truc(format!("{reason}, {debug}"))
+fn truc_error(_reason: &'static str, debug: String) -> MempoolError {
+    // Core exposes one stable package/RPC reject reason and puts the precise
+    // policy explanation in the debug portion. Keep the old internal reason
+    // argument at call sites so the policy checks remain self-documenting.
+    MempoolError::Truc(format!("TRUC-violation, {debug}"))
 }
 
 /// The package test-accept path needs to preserve the first transaction that
@@ -780,6 +785,7 @@ fn package_individual_retryable(error: &MempoolError) -> bool {
             | MempoolError::MinRelayFeeWithContext(_)
             | MempoolError::Full
             | MempoolError::TooManyReplacementCandidates { .. }
+            | MempoolError::TooManyConflictingClusters { .. }
             | MempoolError::ReplacementFee
             | MempoolError::ReplacementFeeWithContext(_)
             | MempoolError::ReplacementFeerateDiagram
@@ -2120,19 +2126,6 @@ impl Mempool {
                     package_fallback.push(transaction.clone());
                 }
                 Err(error) => {
-                    // Core checks aggregate package limits before exposing a
-                    // later member's script-policy failure. Keep the valid
-                    // individual prefix in `candidate`, but surface the
-                    // package limit when the complete package is too large.
-                    if let Some(package_error) =
-                        self.package_size_limit_error(transactions, chain, time::unix_time())
-                    {
-                        return (
-                            candidate,
-                            Err(MempoolError::MempoolLimits(package_error)),
-                            false,
-                        );
-                    }
                     return (candidate, Err(error), false);
                 }
             }
@@ -2252,17 +2245,15 @@ impl Mempool {
                 .collect::<Vec<_>>();
             direct_conflicts.sort();
             direct_conflicts.dedup();
-            candidate.check_conflict_topology(&direct_conflicts)?;
-            if let Some(transaction) = transactions.last() {
-                // Core's package-RBF limit is the number of individual
-                // replacement candidates (each direct conflict plus all of
-                // its descendants), not the number of connected clusters.
-                // Use the package child in the diagnostic because that is
-                // the transaction being evaluated as the replacement.
-                candidate.check_replacement_candidate_limit(
+            if let Some(transaction) = transactions.first() {
+                // Core checks the number of distinct conflicting clusters
+                // before walking their descendants. This preserves the
+                // bounded-work rejection when a package touches many large
+                // clusters, even if one of those clusters is not a valid
+                // package-RBF topology on its own.
+                candidate.check_replacement_cluster_limit(
                     transaction.compute_txid(),
                     &direct_conflicts,
-                    false,
                 )?;
             }
             if !direct_conflicts.is_empty() {
@@ -2300,10 +2291,12 @@ impl Mempool {
             // aggregate package fee is checked after all members have been
             // staged, allowing a zero-fee parent to be paid for by its child.
             let enforce_fee_rate = !use_package_feerate;
-            // Core's package feerate can bypass the rolling mempool minimum,
-            // but it never bypasses the static minrelaytxfee for an
-            // individual transaction (TRUC has its own explicit exception).
-            let enforce_min_relay = true;
+            // Core's child-with-parents package path applies both the
+            // rolling mempool minimum and minrelaytxfee to the aggregate
+            // package. Do not reject a zero-fee parent here; the aggregate
+            // check below is the policy gate. Single-transaction package
+            // calls still enforce the individual floor.
+            let enforce_min_relay = !use_package_feerate;
             let result = if transactions.len() == 1 {
                 // Core's package path still permits a single transaction to
                 // replace an existing mempool conflict, but does not apply
@@ -2466,30 +2459,6 @@ impl Mempool {
         fallback.to_owned()
     }
 
-    fn package_size_limit_error(
-        &self,
-        transactions: &[Transaction],
-        chain: &ChainState,
-        added_at: u64,
-    ) -> Option<String> {
-        let total_vsize = self
-            .package_vsize_for_test(transactions, chain, added_at)
-            .ok()?;
-        if total_vsize > self.policy.ancestor_size_limit_vbytes {
-            Some(format!(
-                "package size {total_vsize} exceeds ancestor size limit [limit: {}]",
-                self.policy.ancestor_size_limit_vbytes
-            ))
-        } else if total_vsize > self.policy.descendant_size_limit_vbytes {
-            Some(format!(
-                "package size {total_vsize} exceeds descendant size limit [limit: {}]",
-                self.policy.descendant_size_limit_vbytes
-            ))
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn accept_package_for_test(
         &self,
         transactions: &[Transaction],
@@ -2514,14 +2483,6 @@ impl Mempool {
             );
         }
         let added_at = time::unix_time();
-        if let Some(error) = self.package_size_limit_error(transactions, chain, added_at) {
-            return (
-                self.clone(),
-                Err(PackageTestAcceptFailure::Package {
-                    error: format!("package-mempool-limits, {error}"),
-                }),
-            );
-        }
         let mut candidate = self.clone();
         let mut accepted = Vec::with_capacity(transactions.len());
         for (index, transaction) in transactions.iter().enumerate() {
@@ -2662,6 +2623,11 @@ impl Mempool {
         }
         let direct_conflicts = self.conflicts_for(&transaction);
         let replacement_id = transaction.compute_txid();
+        // Core bounds ordinary replacement work by the number of distinct
+        // conflicting clusters and reports that condition before collecting
+        // descendants. This also preserves the v31.1 diagnostic for a
+        // replacement touching 101 independent clusters.
+        self.check_replacement_cluster_limit(replacement_id, &direct_conflicts)?;
         self.check_replacement_candidate_limit(replacement_id, &conflicts, sibling_eviction)?;
         self.check_replacement_policy(&direct_conflicts)?;
         let conflicting_ancestor = self
@@ -2808,7 +2774,7 @@ impl Mempool {
     ) -> Result<(), MempoolError> {
         let count = self.conflicting_cluster_count(direct_conflicts);
         if count > MAX_REPLACEMENT_CANDIDATES {
-            return Err(MempoolError::TooManyReplacementCandidates {
+            return Err(MempoolError::TooManyConflictingClusters {
                 txid,
                 count,
                 limit: MAX_REPLACEMENT_CANDIDATES,
@@ -2854,59 +2820,6 @@ impl Mempool {
             })
         {
             return Err(MempoolError::ReplacementDisallowed);
-        }
-        Ok(())
-    }
-
-    /// Package RBF's feerate-diagram calculation only supports clusters with
-    /// at most one ancestor and one descendant. Match Core's diagnostics for
-    /// direct conflicts before staging their replacement package.
-    fn check_conflict_topology(&self, direct_conflicts: &[Txid]) -> Result<(), MempoolError> {
-        let mut conflicts = self
-            .conflicts_and_descendants(direct_conflicts)
-            .into_iter()
-            .collect::<Vec<_>>();
-        conflicts.sort_unstable();
-        for conflict in conflicts {
-            let ancestor_count = self.ancestors(&conflict).len().saturating_add(1);
-            let descendant_count = self.descendants(&conflict).len().saturating_add(1);
-            let txid = conflict.to_string();
-            let has_ancestor = ancestor_count > 1;
-            let has_descendant = descendant_count > 1;
-            if ancestor_count > 2 {
-                return Err(MempoolError::PackageRbfConflictTopology(format!(
-                    "{txid} has {} ancestors, max 1 allowed",
-                    ancestor_count.saturating_sub(1)
-                )));
-            }
-            if descendant_count > 2 {
-                return Err(MempoolError::PackageRbfConflictTopology(format!(
-                    "{txid} has {} descendants, max 1 allowed",
-                    descendant_count.saturating_sub(1)
-                )));
-            }
-            if has_ancestor && has_descendant {
-                return Err(MempoolError::PackageRbfConflictTopology(format!(
-                    "{txid} has both ancestor and descendant, exceeding cluster limit of 2"
-                )));
-            }
-            if has_descendant {
-                if let Some(child) = self.children(&conflict).first()
-                    && self.ancestors(child).len().saturating_add(1) > 2
-                {
-                    return Err(MempoolError::PackageRbfConflictTopology(format!(
-                        "{txid} is not the only parent of child {child}"
-                    )));
-                }
-            } else if has_ancestor {
-                if let Some(parent) = self.parents(&conflict).first()
-                    && self.descendants(parent).len().saturating_add(1) > 2
-                {
-                    return Err(MempoolError::PackageRbfConflictTopology(format!(
-                        "{txid} is not the only child of parent {parent}"
-                    )));
-                }
-            }
         }
         Ok(())
     }
@@ -2961,79 +2874,41 @@ impl Mempool {
         replacement_id: Txid,
         conflicts: &[Txid],
     ) -> bool {
-        // Mirror CTxMemPool::ChangeSet::CalculateChunksForRBF.  The old
-        // diagram is built from the exact transactions that will be removed,
-        // while the new diagram contains the retained direct parents plus the
-        // replacement package.  Comparing whole connected components here is
-        // subtly different: it can include unrelated retained descendants or
-        // convexify the new parent/replacement pair in a different order.
-        let removal = self.conflicts_and_descendants(conflicts);
-        let mut old_chunks = Vec::new();
-        for txid in &removal {
-            let Some(entry) = self.entries.get(txid) else {
-                continue;
-            };
-            // A transaction with descendants is represented by its last
-            // descendant below, just as Core's descendant-count loop skips
-            // non-leaf entries.
-            if !self.descendants(txid).is_empty() {
-                continue;
-            }
-            let individual_fee = self.modified_fee_sat(txid, entry.fee_sat);
-            let individual_size = entry.vsize;
-            let parents = self.parents(txid);
-            if let Some(parent_id) = parents.first()
-                && !removal.contains(parent_id)
-            {
-                let mut package_fee = individual_fee;
-                let mut package_size = individual_size;
-                for ancestor_id in self.ancestors(txid) {
-                    if let Some(ancestor) = self.entries.get(&ancestor_id) {
-                        package_fee = package_fee
-                            .saturating_add(self.modified_fee_sat(&ancestor_id, ancestor.fee_sat));
-                        package_size = package_size.saturating_add(ancestor.vsize);
-                    }
-                }
-                if compare_fee_rate(individual_fee, individual_size, package_fee, package_size)
-                    == Ordering::Greater
-                {
-                    old_chunks.push((package_fee, package_size));
-                } else {
-                    old_chunks.push((
-                        package_fee.saturating_sub(individual_fee),
-                        package_size.saturating_sub(individual_size),
-                    ));
-                    old_chunks.push((individual_fee, individual_size));
-                }
-            } else {
-                old_chunks.push((individual_fee, individual_size));
-            }
+        // Core's staging graph compares every cluster touched by the
+        // replacement, including clusters introduced by new unconfirmed
+        // inputs.  Comparing only the direct conflict missed that second
+        // cluster: a replacement spending an unconfirmed low-fee parent was
+        // accepted even when it made the combined feerate diagram worse.
+        let mut old_members = HashSet::new();
+        for conflict in conflicts {
+            old_members.extend(self.connected_component(conflict));
+        }
+        for ancestor in candidate.ancestors(&replacement_id) {
+            old_members.extend(self.connected_component(&ancestor));
         }
 
-        let mut new_chunks = Vec::new();
-        for txid in &removal {
-            let Some(parent_id) = self.parents(txid).first().copied() else {
-                continue;
-            };
-            if removal.contains(&parent_id) {
-                continue;
+        let diagram_for = |pool: &Self, members: &HashSet<Txid>| {
+            let mut chunks = Vec::new();
+            for txid in pool.mining_order(u64::MAX, 0) {
+                if !members.contains(&txid) {
+                    continue;
+                }
+                let Some(entry) = pool.entries.get(&txid) else {
+                    continue;
+                };
+                append_feerate_chunk(
+                    &mut chunks,
+                    pool.modified_fee_sat(&txid, entry.fee_sat),
+                    entry.vsize,
+                );
             }
-            if let Some(parent) = self.entries.get(&parent_id) {
-                new_chunks.push((
-                    self.modified_fee_sat(&parent_id, parent.fee_sat),
-                    parent.vsize,
-                ));
-            }
-        }
-        if let Some(replacement) = candidate.entries.get(&replacement_id) {
-            new_chunks.push((
-                candidate.modified_fee_sat(&replacement_id, replacement.fee_sat),
-                replacement.vsize,
-            ));
-        }
+            sort_fee_rate_chunks(&mut chunks);
+            chunks
+        };
 
-        sort_fee_rate_chunks(&mut old_chunks);
-        sort_fee_rate_chunks(&mut new_chunks);
+        let old_chunks = diagram_for(self, &old_members);
+        let new_members = candidate.connected_component(&replacement_id);
+        let new_chunks = diagram_for(candidate, &new_members);
         compare_fee_rate_diagrams(&new_chunks, &old_chunks) == Some(Ordering::Greater)
     }
 
@@ -3240,7 +3115,7 @@ impl Mempool {
         allow_truc_descendant_replacement: bool,
         enforce_min_relay: bool,
         force_truc_min_relay: bool,
-        allow_cpfp_carveout: bool,
+        _allow_cpfp_carveout: bool,
     ) -> Result<Txid, MempoolError> {
         // During AssumeUTXO activation the snapshot chainstate serves UTXOs
         // at its base height while the background chainstate is still lower.
@@ -3505,9 +3380,11 @@ impl Mempool {
             );
             return Err(error);
         }
-        if enforce_mempool_policy {
-            self.check_ancestor_descendant_limits(&transaction, vsize, allow_cpfp_carveout)?;
-        }
+        // Core v31.1 keeps the deprecated ancestor/descendant arguments for
+        // wallet coin selection; mempool admission is governed by connected
+        // cluster limits instead. Do not apply the old 25-transaction
+        // ancestor cap here or ordinary 64-transaction clusters are
+        // rejected before the v31 policy check runs.
         if enforce_mempool_policy && check_ephemeral_spends {
             // Core checks package and single-transaction fee floors before
             // the final ephemeral-dust spentness check.  This preserves the
@@ -3538,10 +3415,11 @@ impl Mempool {
         } else {
             (Vec::new(), Vec::new())
         };
-        let index_memory_usage = self
-            .electrum_index_enabled
-            .then(|| scripthash_index_memory_usage(&affected_scripts, &input_script_values))
-            .unwrap_or_default();
+        let index_memory_usage = if self.electrum_index_enabled {
+            scripthash_index_memory_usage(&affected_scripts, &input_script_values)
+        } else {
+            0
+        };
         let memory_usage =
             mempool_entry_memory_usage(&transaction).saturating_add(index_memory_usage);
         if enforce_mempool_policy {
@@ -3643,87 +3521,6 @@ impl Mempool {
             pending.extend(self.parents(&txid));
         }
         ancestors
-    }
-
-    /// Apply Core's legacy ancestor/descendant limits to a transaction before
-    /// the TRUC and cluster checks. The limits are measured in adjusted
-    /// virtual bytes and include the candidate transaction itself.
-    fn check_ancestor_descendant_limits(
-        &self,
-        transaction: &Transaction,
-        vsize: u64,
-        allow_cpfp_carveout: bool,
-    ) -> Result<(), MempoolError> {
-        let ancestors = self.ancestors_for_transaction(transaction);
-        if ancestors.len().saturating_add(1) > self.policy.ancestor_count_limit {
-            return Err(MempoolError::MempoolLimits(format!(
-                "too many unconfirmed ancestors [limit: {}]",
-                self.policy.ancestor_count_limit
-            )));
-        }
-
-        let ancestor_size = ancestors.iter().fold(vsize, |size, txid| {
-            size.saturating_add(self.entries.get(txid).map_or(0, |entry| entry.vsize))
-        });
-        if ancestor_size > self.policy.ancestor_size_limit_vbytes {
-            return Err(MempoolError::MempoolLimits(format!(
-                "exceeds ancestor size limit [limit: {}]",
-                self.policy.ancestor_size_limit_vbytes
-            )));
-        }
-
-        // Core's single-transaction CPFP carve-out allows one small child
-        // beyond a parent's descendant count/size limits. It is deliberately
-        // disabled for package evaluation and testmempoolaccept, where Core
-        // does not grant the carve-out. The candidate must have exactly one
-        // in-mempool ancestor and that parent must already be at both limits.
-        let cpfp_parent = ancestors.iter().next().copied();
-        let cpfp_carveout = allow_cpfp_carveout
-            && vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT
-            && ancestors.len() == 1
-            && cpfp_parent.is_some_and(|parent_id| {
-                self.descendants(&parent_id).len().saturating_add(1)
-                    == self.policy.descendant_count_limit
-            });
-        let descendant_count_limit = self
-            .policy
-            .descendant_count_limit
-            .saturating_add(usize::from(cpfp_carveout));
-        let descendant_size_limit =
-            self.policy
-                .descendant_size_limit_vbytes
-                .saturating_add(if cpfp_carveout {
-                    EXTRA_DESCENDANT_TX_SIZE_LIMIT
-                } else {
-                    0
-                });
-
-        for ancestor_id in ancestors {
-            let descendants = self.descendants(&ancestor_id);
-            let descendant_count = descendants.len().saturating_add(2);
-            if descendant_count > descendant_count_limit {
-                return Err(MempoolError::MempoolLimits(format!(
-                    "too many descendants for tx {ancestor_id} [limit: {}]",
-                    descendant_count_limit
-                )));
-            }
-            let descendant_size = descendants.iter().fold(
-                self.entries
-                    .get(&ancestor_id)
-                    .map_or(0, |entry| entry.vsize)
-                    .saturating_add(vsize),
-                |size, txid| {
-                    size.saturating_add(self.entries.get(txid).map_or(0, |entry| entry.vsize))
-                },
-            );
-            if descendant_size > descendant_size_limit {
-                return Err(MempoolError::MempoolLimits(format!(
-                    "exceeds descendant size limit for tx {ancestor_id} [limit: {}]",
-                    descendant_size_limit
-                )));
-            }
-        }
-        Ok(())
     }
 
     fn ensure_space(
@@ -4455,24 +4252,10 @@ impl Mempool {
             }
         }
 
-        // Transactions resurrected from a block are admitted with the reorg
-        // carve-outs, so a child can temporarily re-enter even when it leaves
-        // one of an ephemeral-dust parent's outputs unspent. Core removes
-        // that child (and its descendants) before the reorg is exposed.
-        let ephemeral_failures = self
-            .entries
-            .iter()
-            .filter_map(|(txid, entry)| {
-                validate_ephemeral_spends(std::slice::from_ref(&entry.transaction), self)
-                    .is_err()
-                    .then_some(*txid)
-            })
-            .collect::<Vec<_>>();
-        for txid in ephemeral_failures {
-            if self.entries.contains_key(&txid) {
-                self.remove_recursive(&txid);
-            }
-        }
+        // Core deliberately does not rerun the package ephemeral-dust
+        // spentness check during reorg cleanup. Transactions resurrected
+        // from a block were admitted with the reorg carve-outs and remain
+        // eligible until ordinary relay/package admission evaluates them.
     }
 
     pub fn clear_expired(&mut self, now: u64, age: Duration) {
@@ -5068,16 +4851,18 @@ fn validate_standard_policy_with_modified_fee_and_policy(
     if dust_outputs == 1 && (base_fee_sat != 0 || modified_fee_sat != 0) {
         return Err(MempoolError::DustWithFee);
     }
-    if data_carrier_outputs > 1 {
-        return Err(MempoolError::NonStandard("multi-op-return".to_owned()));
-    }
+    // Core v30 removed the historical one-OP_RETURN-output restriction.
+    // Multiple nulldata outputs are standard as long as their aggregate
+    // script bytes fit within -datacarriersize and the other policy checks
+    // pass. Keep the output count above for the bare-datacarrier check.
     if monetary_outputs == 0 && data_carrier_outputs > 0 && !policy.permit_bare_datacarrier {
         return Err(MempoolError::NonStandard("bare-datacarrier".to_owned()));
     }
 
     // Core's BIP54 check counts legacy sigops across the complete
-    // transaction before checking each individual input's standardness. This
-    // gives `-maxtxlegacysigops` its stable aggregate reject reason.
+    // transaction before checking each individual input's standardness. The
+    // public policy result is still the generic AreInputsStandard diagnostic,
+    // not a separate BIP54 reason.
     let mut legacy_sigops = 0usize;
     for (input, previous) in transaction.input.iter().zip(previous_outputs) {
         legacy_sigops = legacy_sigops
@@ -5092,7 +4877,7 @@ fn validate_standard_policy_with_modified_fee_and_policy(
     }
     if legacy_sigops > policy.max_tx_legacy_sigops {
         return Err(MempoolError::NonStandard(
-            "bad-txns-input-sigops-toomany-overall".to_owned(),
+            "bad-txns-nonstandard-inputs".to_owned(),
         ));
     }
     validate_standard_inputs(transaction, previous_outputs)?;
@@ -5106,7 +4891,17 @@ fn validate_standard_policy_with_modified_fee_and_policy(
             "bad-txns-too-many-sigops".to_owned(),
         ));
     }
-    validate_standard_witnesses(transaction, previous_outputs, policy.max_script_size)?;
+    // Core's IsWitnessStandard returns only a boolean. Map its detailed
+    // bad-witness classifications to Core's stable reject reason while
+    // preserving script-policy diagnostics emitted by later checks.
+    validate_standard_witnesses(transaction, previous_outputs, policy.max_script_size).map_err(
+        |error| match error {
+            MempoolError::NonStandard(reason) if reason.starts_with("bad-witness-") => {
+                MempoolError::NonStandard("bad-witness-nonstandard".to_owned())
+            }
+            error => error,
+        },
+    )?;
     validate_standard_simple_ecdsa_spends(transaction, previous_outputs)
 }
 
@@ -5298,11 +5093,10 @@ fn validate_standard_inputs(
                 || is_p2a_script(spending_script))
         {
             return Err(MempoolError::NonStandard(
-                // Core's AreInputsStandard prefixes this structural input
-                // policy failure with `bad-txns-input-`; unlike a generic
-                // nonstandard-inputs failure it also places both txid and
-                // wtxid in the recent-reject filter.
-                "bad-txns-input-witness-unknown".to_owned(),
+                // Core's AreInputsStandard returns false for unknown
+                // witness programs, and AcceptToMemoryPool reports the
+                // common input-policy reason for that result.
+                "bad-txns-nonstandard-inputs".to_owned(),
             ));
         }
         if !is_standard_spend_script(&previous.script_pubkey) {
@@ -5400,25 +5194,18 @@ fn validate_standard_witnesses(
         let spending_script = redeem_script.as_deref().unwrap_or(&previous.script_pubkey);
         if !spending_script.is_witness_program() {
             return Err(MempoolError::NonStandard(
-                // Core's IsWitnessStandard uses the witness-specific reason
-                // prefix for witness data attached to a legacy input. This
-                // rejection is witness-mutated and must not poison the
-                // txid reject filter.
-                "bad-witness-nonwitness-input".to_owned(),
+                // Core maps every IsWitnessStandard failure, including
+                // witness data attached to a legacy input, to this generic
+                // witness-policy reason.
+                "bad-witness-nonstandard".to_owned(),
             ));
         }
-        // Keep the same policy-size limit Core applies to the serialized
-        // witness stack before checking the witness-version-specific rules.
-        if input.witness.size() > max_script_size {
-            return Err(MempoolError::NonStandard(
-                "bad-witness-witness-size".to_owned(),
-            ));
-        }
-        // Core has a dedicated reason for witness stuffing on a direct P2A
-        // output. The anchor itself is valid with an empty witness only.
+        // Core rejects witness stuffing on a direct P2A output, but exposes
+        // the generic IsWitnessStandard rejection reason at the RPC layer.
+        // The anchor itself is valid with an empty witness only.
         if is_p2a_script(spending_script) && !previous.script_pubkey.is_p2sh() {
             return Err(MempoolError::NonStandard(
-                "bad-witness-anchor-not-empty".to_owned(),
+                "bad-witness-nonstandard".to_owned(),
             ));
         } else if spending_script.is_p2wpkh() {
             let Some(pubkey) = input.witness.iter().nth(1) else {
@@ -5440,7 +5227,7 @@ fn validate_standard_witnesses(
                     "bad-witness-nonstandard".to_owned(),
                 ));
             };
-            if witness_script.len() > 3_600 {
+            if witness_script.len() > max_script_size {
                 return Err(MempoolError::NonStandard(
                     "bad-witness-script-size".to_owned(),
                 ));
@@ -7369,7 +7156,7 @@ mod tests {
                 Txid::from_byte_array([201; 32]),
                 &independent_conflicts,
             ),
-            Err(MempoolError::TooManyReplacementCandidates {
+            Err(MempoolError::TooManyConflictingClusters {
                 count: 101,
                 limit: 100,
                 ..
@@ -7756,7 +7543,7 @@ mod tests {
         anchor_spend.output[0].script_pubkey = previous.script_pubkey.clone();
         assert!(matches!(
             validate_standard_policy(&anchor_spend, std::slice::from_ref(&anchor_previous), 0),
-            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-anchor-not-empty"
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
         ));
         anchor_spend.input[0].witness = Witness::default();
         assert!(
@@ -8144,7 +7931,7 @@ mod tests {
         assert!(matches!(
             validate_standard_policy(&transaction, &previous_outputs, 1),
             Err(MempoolError::NonStandard(reason))
-                if reason == "bad-txns-input-sigops-toomany-overall"
+                if reason == "bad-txns-nonstandard-inputs"
         ));
     }
 

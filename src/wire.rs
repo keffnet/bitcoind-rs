@@ -649,6 +649,10 @@ fn log_v1_header_error(error: &WireError) {
         | WireError::Payload(_)
         | WireError::CompactSize => {}
     }
+    // Header errors are part of the protocol's immediate diagnostics. Core's
+    // tests and operators inspect these records while the connection remains
+    // open, so do not leave them behind the normal asynchronous log batch.
+    crate::flush_debug_log();
 }
 
 fn log_v1_header_error_for_frame_with_magic(magic: [u8; 4], frame: &[u8]) {
@@ -745,6 +749,7 @@ fn frame_has_recoverable_error_with_magic(magic: [u8; 4], frame: &[u8]) -> bool 
                 "Exception 'DataStream::read(): end of data' (std::ios_base::failure) caught"
             );
         }
+        crate::flush_debug_log();
         return true;
     }
     false

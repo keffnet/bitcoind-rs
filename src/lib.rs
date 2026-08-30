@@ -60,7 +60,7 @@ pub(crate) mod mining_capnp {
     include!(concat!(env!("OUT_DIR"), "/ipc/mining_capnp.rs"));
 }
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::mem::size_of;
@@ -68,7 +68,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -100,6 +100,25 @@ use crate::mempool::{
 #[cfg(test)]
 use crate::storage::BlockStore;
 use crate::storage::{BlockStoreReader, ElectrumBlockStoreReader, PreparedBlockRecord};
+
+type DebugLogFlushHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+static DEBUG_LOG_FLUSH_HOOK: OnceLock<DebugLogFlushHook> = OnceLock::new();
+
+/// Install the process debug-log flush hook used by the daemon's asynchronous
+/// logger. The hook is optional so library users and tests do not need to
+/// configure a logger. It is intentionally write-once because a node process
+/// owns one logger for its lifetime.
+#[doc(hidden)]
+pub fn install_debug_log_flush_hook(hook: impl Fn() + Send + Sync + 'static) {
+    let _ = DEBUG_LOG_FLUSH_HOOK.set(Arc::new(hook));
+}
+
+pub(crate) fn flush_debug_log() {
+    if let Some(hook) = DEBUG_LOG_FLUSH_HOOK.get() {
+        hook();
+    }
+}
 
 /// Match Bitcoin Core's emergency free-space reserve. Additional write
 /// estimates are added on top of this floor before a mutation starts.
@@ -233,7 +252,6 @@ pub(crate) fn ensure_disk_space(path: &Path, additional: u64) -> Result<()> {
 // address.
 const UNCONNECTED_PEER_ID: usize = usize::MAX;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
-const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHANAGE_LATENCY_SCORE: usize = 3_000;
 const RESERVED_ORPHAN_WEIGHT_PER_PEER: u64 = 404_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
@@ -1304,8 +1322,7 @@ impl OrphanPool {
             let stats = self.peer_stats();
             let peer_count = stats.len().max(1) as u64;
             let max_global_weight = RESERVED_ORPHAN_WEIGHT_PER_PEER.saturating_mul(peer_count);
-            if self.entries.len() <= MAX_ORPHAN_TRANSACTIONS
-                && self.total_latency_score() <= MAX_ORPHANAGE_LATENCY_SCORE
+            if self.total_latency_score() <= MAX_ORPHANAGE_LATENCY_SCORE
                 && self.total_weight() <= max_global_weight
             {
                 return;
@@ -1514,6 +1531,105 @@ struct InflightBlock {
     hash: BlockHash,
     height: u32,
     requested_at: Instant,
+}
+
+#[derive(Default)]
+struct PeerBlockProcessingState {
+    active: bool,
+    next_sequence: u64,
+    waiters: BTreeSet<(u32, u64)>,
+}
+
+/// Serialize chain mutation while preferring the lowest prepared block body.
+///
+/// IBD prepares block records in parallel. A plain FIFO semaphore therefore
+/// orders mutation by zstd completion, allowing a smaller future block to
+/// overtake the active tip's successor and spend seconds walking unrelated
+/// stored state. Keep the single-writer property, but choose the lowest
+/// header height whenever the writer becomes available.
+pub(crate) struct PeerBlockProcessingGate {
+    state: Mutex<PeerBlockProcessingState>,
+    changed: Notify,
+}
+
+impl PeerBlockProcessingGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PeerBlockProcessingState::default()),
+            changed: Notify::new(),
+        }
+    }
+
+    pub(crate) async fn acquire(self: &Arc<Self>, height: u32) -> PeerBlockProcessingPermit {
+        let key = {
+            let mut state = self.state.lock();
+            let key = (height, state.next_sequence);
+            state.next_sequence = state.next_sequence.wrapping_add(1);
+            state.waiters.insert(key);
+            key
+        };
+        let mut waiter = PeerBlockProcessingWaiter {
+            gate: Arc::clone(self),
+            key,
+            admitted: false,
+        };
+        loop {
+            // Register for the wakeup before inspecting state so a permit
+            // release between the check and await cannot be missed.
+            let changed = self.changed.notified();
+            let admitted = {
+                let mut state = self.state.lock();
+                let first = state.waiters.first().copied();
+                if !state.active && first == Some(key) {
+                    state.waiters.remove(&key);
+                    state.active = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if admitted {
+                waiter.admitted = true;
+                return PeerBlockProcessingPermit {
+                    gate: Arc::clone(self),
+                };
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.state.lock().waiters.len()
+    }
+}
+
+struct PeerBlockProcessingWaiter {
+    gate: Arc<PeerBlockProcessingGate>,
+    key: (u32, u64),
+    admitted: bool,
+}
+
+impl Drop for PeerBlockProcessingWaiter {
+    fn drop(&mut self) {
+        if self.admitted {
+            return;
+        }
+        if self.gate.state.lock().waiters.remove(&self.key) {
+            self.gate.changed.notify_waiters();
+        }
+    }
+}
+
+pub(crate) struct PeerBlockProcessingPermit {
+    gate: Arc<PeerBlockProcessingGate>,
+}
+
+impl Drop for PeerBlockProcessingPermit {
+    fn drop(&mut self) {
+        self.gate.state.lock().active = false;
+        self.gate.changed.notify_waiters();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1922,7 +2038,7 @@ pub struct Node {
     /// Admit one prepared peer block at a time to synchronous chain mutation.
     /// Serialization and compression happen before this gate, so CPU-heavy
     /// preparation remains parallel without a convoy of competing writers.
-    pub(crate) peer_block_processing: tokio::sync::Semaphore,
+    pub(crate) peer_block_processing: Arc<PeerBlockProcessingGate>,
     /// Bound the number of received IBD bodies that may wait for ordered
     /// chainstate activation. The peer reader must keep draining the socket
     /// while the single chain-mutation lane validates an earlier block.
@@ -2452,23 +2568,38 @@ impl Node {
                 .with_context(|| format!("creating {}", banlist_path.display()))?;
         }
         let peers_path = config.datadir.join("peers.json");
+        // Core's `-test=addrman` mode is used by deterministic address-manager
+        // tests after they remove Core's peers.dat.  The native implementation
+        // stores the same state as peers.json, so start that test mode from an
+        // empty manager as well instead of resurrecting the previous JSON
+        // snapshot.
         let (
             known_addresses,
             tried_addresses,
             network_addresses,
             network_tried_addresses,
             network_address_sources,
-        ) = match load_known_addresses(&config.datadir) {
-            Ok(state) => state,
-            Err(error) => {
-                quarantine_persistent_file(&peers_path, &error);
-                (
-                    HashMap::new(),
-                    HashSet::new(),
-                    HashMap::new(),
-                    HashSet::new(),
-                    HashMap::new(),
-                )
+        ) = if deterministic_addrman {
+            (
+                HashMap::new(),
+                HashSet::new(),
+                HashMap::new(),
+                HashSet::new(),
+                HashMap::new(),
+            )
+        } else {
+            match load_known_addresses(&config.datadir) {
+                Ok(state) => state,
+                Err(error) => {
+                    quarantine_persistent_file(&peers_path, &error);
+                    (
+                        HashMap::new(),
+                        HashSet::new(),
+                        HashMap::new(),
+                        HashSet::new(),
+                        HashMap::new(),
+                    )
+                }
             }
         };
         let block_relay_only_anchors_path = network_datadir.join(BLOCK_RELAY_ONLY_ANCHORS_FILE);
@@ -2571,7 +2702,7 @@ impl Node {
             block_relay_only_anchors: parking_lot::RwLock::new(block_relay_only_anchors),
             banlist_recreated: !banlist_exists,
             mining_lock: Mutex::new(()),
-            peer_block_processing: tokio::sync::Semaphore::new(1),
+            peer_block_processing: Arc::new(PeerBlockProcessingGate::new()),
             // Keep parsed bodies bounded separately from Core's wire request
             // window. A parsed block is much larger than its wire payload;
             // sixty-four queued bodies preserve reader/validator overlap
@@ -3851,6 +3982,8 @@ impl Node {
         let retryable = matches!(
             error,
             MempoolError::FeeRate
+                | MempoolError::MinRelayFee
+                | MempoolError::MinRelayFeeWithContext(_)
                 | MempoolError::Full
                 | MempoolError::ReplacementFee
                 | MempoolError::ReplacementFeeWithContext(_)
@@ -5206,12 +5339,16 @@ impl Node {
             return true;
         }
         // Once the best header is within a day of the local clock, Core has
-        // moved this peer into the normal parallel-sync path.  In that state
-        // an unknown block announcement can request headers again even when
-        // the peer previously triggered the one-shot pre-sync probe.  Keep
-        // the pre-sync admission gate below for stale chains, but do not let
-        // its historical per-peer flag suppress live block relay forever.
-        if self.best_header_is_recent() {
+        // moved eligible full/limited peers into the normal parallel-sync
+        // path.  Relay-only peers do not have Core's fSyncStarted state and
+        // still use the one-shot inventory-triggered probe below.
+        if self.best_header_is_recent()
+            && self
+                .peers
+                .read()
+                .get(&peer_id)
+                .is_some_and(Self::headers_sync_peer_is_eligible)
+        {
             return true;
         }
         let mut triggered = self.inv_triggered_headers_sync.lock();
@@ -6223,13 +6360,12 @@ impl Node {
             let assumeutxo_common_height = chain.assumeutxo_download_common_height_for_path(hashes);
             // Core's pindexLastCommonBlock is anchored at the fork point with
             // the active chain, then advances over a contiguous sequence of
-            // bodies marked BLOCK_VALID_TRANSACTIONS/HaveNumChainTxs.  A body
-            // that is merely present in the native store is not enough: it
-            // may be malformed, invalid, or separated from the fork by a
-            // missing ancestor.  The chain state records the equivalent
-            // status only after a peer body completes admission, so this
-            // remains conservative without pinning the window to the active
-            // tip while out-of-order bodies are already ready.
+            // bodies marked BLOCK_VALID_TRANSACTIONS/HaveNumChainTxs. Native
+            // storage only contains bodies that completed block admission, so
+            // an already-stored side-chain body is just as eligible as one
+            // received during this process. The path walk below still makes
+            // the result contiguous: a stored suffix cannot skip a missing
+            // ancestor.
             //
             // AssumeUTXO is the exception: its historical cursor explicitly
             // identifies the last body available to the background chainstate
@@ -6636,6 +6772,10 @@ impl Node {
 
     pub fn set_network_active(&self, active: bool) {
         info!("SetNetworkActive: {active}");
+        // Core's functional tests inspect this control-plane diagnostic as
+        // soon as the RPC returns. Do not leave it behind the async logger's
+        // normal batching interval.
+        crate::flush_debug_log();
         self.network_active.store(active, Ordering::Relaxed);
         if !active {
             self.disconnect_all_peers();
@@ -8838,7 +8978,7 @@ fn quarantine_persistent_file(path: &Path, error: &anyhow::Error) {
 
 struct SettingsObjectVisitor;
 
-const SETTINGS_WARNING: &str = "This file is automatically generated and updated by Bitcoin Core functional test harness. Please do not edit this file while the node is running, as any changes might be ignored or overwritten.";
+const SETTINGS_WARNING: &str = "This file is automatically generated and updated by bitcoind-rs. Please do not edit this file while the node is running, as any changes might be ignored or overwritten.";
 
 impl<'de> Visitor<'de> for SettingsObjectVisitor {
     type Value = serde_json::Value;
@@ -8899,14 +9039,14 @@ fn initialize_settings_file(path: &Path) -> Result<()> {
                     )
                 } else {
                     anyhow::anyhow!(
-                        "Settings file {} does not contain valid JSON. This is probably caused by disk corruption or a crash",
+                        "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error",
                         path.display()
                     )
                 }
             })?;
         deserializer.end().map_err(|_error| {
             anyhow::anyhow!(
-                "Settings file {} does not contain valid JSON. This is probably caused by disk corruption or a crash",
+                "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error",
                 path.display()
             )
         })?;
@@ -9272,6 +9412,37 @@ mod tests {
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
     use clap::Parser;
+
+    #[tokio::test]
+    async fn peer_block_processing_prefers_the_lowest_prepared_height() {
+        let gate = Arc::new(PeerBlockProcessingGate::new());
+        let active = gate.acquire(100).await;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        for height in [300, 200] {
+            let gate = Arc::clone(&gate);
+            let sender = sender.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = gate.acquire(height).await;
+                sender.send(height).unwrap();
+            }));
+        }
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.waiter_count() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both prepared blocks should enter the admission queue");
+
+        drop(active);
+        assert_eq!(receiver.recv().await, Some(200));
+        assert_eq!(receiver.recv().await, Some(300));
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
 
     #[test]
     fn disk_space_reserve_includes_additional_write_budget() {
@@ -10738,13 +10909,61 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![side_three.block_hash()]
         );
-        // Core does not advance pindexLastCommonBlock over future side-chain
-        // bodies. The peer still gets the stored descendant requested, but
-        // the download window remains anchored at the active-chain fork.
+        // Core advances pindexLastCommonBlock over contiguous side-chain
+        // bodies that already have transaction-count state, even before the
+        // branch becomes active. The download window therefore starts after
+        // side_two while the stored descendant is requested next.
         assert_eq!(
             node.peers.read().get(&1).unwrap().last_common_block,
-            Some(genesis.block_hash())
+            Some(side_two.block_hash())
         );
+    }
+
+    #[test]
+    fn block_download_scheduler_advances_over_ready_side_chain_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let genesis = *node.chain.read().header(0).unwrap();
+
+        // Keep the active chain longer than the first side-chain download
+        // window. The side branch therefore remains non-active while its
+        // first 1,024 bodies are received, just as it does during a large
+        // reorg from a peer with a higher-work chain.
+        let mut active_header = genesis;
+        for height in 1..=1_300 {
+            let block = mine_test_block(&active_header, height, 1);
+            active_header = block.header;
+            node.connect_block(block).unwrap();
+        }
+
+        let mut side_header = genesis;
+        let mut side_blocks = Vec::with_capacity(2_300);
+        for height in 1..=2_300 {
+            let block = mine_test_block(&side_header, height, 2);
+            side_header = block.header;
+            side_blocks.push(block);
+        }
+        let side_headers = side_blocks
+            .iter()
+            .map(|block| block.header)
+            .collect::<Vec<_>>();
+        node.chain.write().accept_headers(&side_headers).unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        node.update_peer_best_known_block(1, side_blocks.last().unwrap().block_hash());
+
+        for block in side_blocks.into_iter().take(1_024) {
+            node.connect_block_from_peer(block).unwrap();
+        }
+
+        let schedule = node.next_block_download_schedule(
+            1,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+        assert_eq!(schedule.requests.len(), MAX_BLOCKS_IN_TRANSIT_PER_PEER);
+        assert_eq!(schedule.requests[0].hash, side_headers[1_024].block_hash());
     }
 
     #[test]
@@ -10979,7 +11198,7 @@ mod tests {
         let second = mine_test_block(&first.header, 2, 1);
         node.chain
             .write()
-            .accept_headers(&[first.header.clone(), second.header.clone()])
+            .accept_headers(&[first.header, second.header])
             .unwrap();
 
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();

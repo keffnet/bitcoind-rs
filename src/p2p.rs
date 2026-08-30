@@ -513,7 +513,7 @@ fn peer_block_download_allowed_for_node(
     let initial_block_download = node
         .chain
         .try_read()
-        .map_or(true, |chain| chain.is_initial_block_download());
+        .is_none_or(|chain| chain.is_initial_block_download());
     if !peer_block_download_allowed(initial_block_download, peer_services) {
         return false;
     }
@@ -4423,6 +4423,10 @@ async fn serve_peer(
             {
                 debug!("V2 transport error: V1 peer with wrong MessageStart");
             }
+            // Transport handshake failures are immediately observable to
+            // operators and functional tests; do not leave the classification
+            // behind the normal asynchronous log batch.
+            crate::flush_debug_log();
             return Err(error);
         }
     };
@@ -4892,6 +4896,11 @@ async fn serve_peer_loop(
                     } else {
                         debug!("version handshake timeout, disconnecting peer={peer_id}");
                     }
+                    // Timeout diagnostics are checked immediately by Core's
+                    // functional tests and are useful during live peer
+                    // troubleshooting.  Do not leave them in the async
+                    // logger buffer while the connection is being torn down.
+                    crate::flush_debug_log();
                     anyhow::bail!("version handshake timeout");
                 }
                 continue;
@@ -5428,12 +5437,14 @@ async fn serve_peer_loop(
                 }
                 if verack_received {
                     debug!("sendtxrcncl received after verack, disconnecting peer={peer_id}");
+                    crate::flush_debug_log();
                     anyhow::bail!("sendtxrcncl received after verack");
                 }
                 if !peer_state.local_relay_transactions {
                     debug!(
                         "sendtxrcncl received to which we indicated no tx relay, disconnecting peer={peer_id}"
                     );
+                    crate::flush_debug_log();
                     anyhow::bail!("sendtxrcncl received on a non-relaying connection");
                 }
                 if peer_version < WTXID_RELAY_VERSION
@@ -5446,10 +5457,12 @@ async fn serve_peer_loop(
                     debug!(
                         "sendtxrcncl received which indicated no tx relay to us, disconnecting peer={peer_id}"
                     );
+                    crate::flush_debug_log();
                     anyhow::bail!("sendtxrcncl received from a non-relaying peer");
                 }
                 if message.version < TX_RECONCILIATION_VERSION {
                     debug!("txreconciliation protocol violation, disconnecting peer={peer_id}");
+                    crate::flush_debug_log();
                     anyhow::bail!("unsupported transaction reconciliation version");
                 }
                 let mut registered = peer_state.tx_reconciliation_registered.lock();
@@ -5457,6 +5470,7 @@ async fn serve_peer_loop(
                     debug!(
                         "(sendtxrcncl received from already registered peer), disconnecting peer={peer_id}"
                     );
+                    crate::flush_debug_log();
                     anyhow::bail!("duplicate sendtxrcncl message");
                 }
                 debug!("Register peer={peer_id} (inbound={})", !outbound);
@@ -5926,10 +5940,19 @@ async fn serve_peer_loop(
                     let last_hash = headers_to_accept.last().map(|header| header.block_hash());
                     let accepted = match chain.accept_headers(&headers_to_accept) {
                         Ok(accepted) => accepted,
-                        Err(error)
-                            if error.to_string().contains("is on an invalidated branch")
-                                || error.to_string().contains("has an invalidated parent") =>
-                        {
+                        Err(error) if error.to_string().contains("has an invalidated parent") => {
+                            node.clear_pending_header_direct_fetches(
+                                peer_id,
+                                &pending_direct_fetch_claims,
+                            );
+                            // A new header extending a cached-invalid parent
+                            // is BLOCK_INVALID_PREV in Core, not merely a
+                            // repeat announcement of the cached-invalid
+                            // header. Disconnect every peer that sends it,
+                            // including inbound and manual connections.
+                            return Err(error);
+                        }
+                        Err(error) if error.to_string().contains("is on an invalidated branch") => {
                             node.clear_pending_header_direct_fetches(
                                 peer_id,
                                 &pending_direct_fetch_claims,
@@ -6260,6 +6283,7 @@ async fn serve_peer_loop(
                                     unknown_block = Some(item.hash);
                                 } else if chain.block_height_by_hash(&item.hash).is_some()
                                     && !node.peer_has_inflight_block_request(peer_id, item.hash)
+                                    && !node.block_request_in_flight(item.hash)
                                     && !node.pending_header_direct_fetch_owned_by_other(
                                         peer_id, item.hash,
                                     )
@@ -6396,6 +6420,15 @@ async fn serve_peer_loop(
             }
             Message::GetData(items) => {
                 debug!("received getdata peer={peer_id}");
+                // A relay-permitted peer is the one exception to blocksonly's
+                // normal transaction suppression. Make this protocol escape
+                // hatch visible immediately for operators and Core's
+                // blocksonly functional checks without flushing every normal
+                // getdata batch during IBD.
+                if node.config.blocksonly && peer_state.permissions.contains(PeerPermissions::RELAY)
+                {
+                    crate::flush_debug_log();
+                }
                 if peer_state.connection_type == "private-broadcast" {
                     let Some(transaction) = peer_state.private_broadcast_transaction.as_ref()
                     else {
@@ -6774,15 +6807,9 @@ async fn serve_peer_loop(
                 }
             }
             Message::Block(block) => {
+                let received_at = Instant::now();
                 let hash = block.header.block_hash();
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
-                // Core releases the per-peer download-window reservation as
-                // soon as the complete body has been received, before
-                // ProcessNewBlock performs validation and chainstate writes.
-                // Keep the parsed body globally reserved while it is queued
-                // below, but do not make the peer wait for the single
-                // validation lane before requesting the next body.
-                node.clear_peer_block_request(peer_id, hash);
                 let (parent_known, was_stored, initial_block_download) = node
                     .chain
                     .try_read()
@@ -6814,13 +6841,23 @@ async fn serve_peer_loop(
                     !peer_state.permissions.contains(PeerPermissions::NO_BAN);
 
                 // Keep the socket reader independent from ordered chainstate
-                // activation during IBD. Core continues receiving a bounded
-                // body queue while its validation/UTXO lane works on the
-                // oldest available block; waiting here makes every peer's
-                // sixteen-block window drain one body at a time instead.
+                // activation during IBD. Core's message handler removes a
+                // request as soon as the body arrives, but it cannot refill
+                // that peer's window until synchronous ProcessBlock returns.
+                // The async reader must retain the reservation until this
+                // body's admission finishes, otherwise every queued task can
+                // immediately open another sixteen-block window and create a
+                // large out-of-order body backlog behind the single mutation
+                // lane.
                 if initial_block_download {
                     match node.peer_block_queue.clone().try_acquire_owned() {
                         Ok(queue_permit) if node.queue_peer_block_hash(hash) => {
+                            // Install the global in-validation reservation
+                            // before the task starts. Keep the per-peer
+                            // reservation too: the synchronous Core message
+                            // loop cannot request a replacement body until
+                            // ProcessBlock has returned, and retaining it
+                            // reproduces that effective backpressure here.
                             let queued_node = Arc::clone(node);
                             let queued_peers = Arc::clone(peers);
                             tokio::spawn(async move {
@@ -6832,8 +6869,16 @@ async fn serve_peer_loop(
                                     requested,
                                     true,
                                     disconnect_on_invalid,
+                                    received_at,
                                 )
                                 .await;
+                                // The successful path normally clears every
+                                // request for this hash from inside
+                                // handle_received_block. Do this unconditionally
+                                // as well so rejected/unrequested bodies do
+                                // not leave the retained Core-style window
+                                // slot occupied forever.
+                                queued_node.clear_peer_block_request(peer_id, hash);
                                 match result {
                                     Ok(true) => {
                                         // A peer can request a block as soon as
@@ -6886,6 +6931,12 @@ async fn serve_peer_loop(
                         Err(_) => {}
                     }
                 }
+                // Keep the per-peer reservation while synchronous validation
+                // is running. The async IBD path clears it only after the
+                // global queue reservation is installed above; doing the
+                // same here prevents a duplicate INV/headers handler from
+                // requesting the body from another peer during the short
+                // validation/storage gap.
                 suppress_block_relay(peer_state, hash);
                 let accepted = handle_received_block(
                     node,
@@ -6894,8 +6945,11 @@ async fn serve_peer_loop(
                     requested,
                     true,
                     disconnect_on_invalid,
+                    received_at,
                 )
-                .await?;
+                .await;
+                node.clear_peer_block_request(peer_id, hash);
+                let accepted = accepted?;
                 if accepted {
                     if compact_reconstruction_failed == Some(hash) {
                         compact_reconstruction_failed = None;
@@ -6928,7 +6982,7 @@ async fn serve_peer_loop(
                 let still_in_initial_block_download = node
                     .chain
                     .try_read()
-                    .map_or(true, |chain| chain.is_initial_block_download());
+                    .is_none_or(|chain| chain.is_initial_block_download());
                 if getaddr_response_pending && !still_in_initial_block_download {
                     getaddr_response_pending = false;
                     if send_getaddr_response(
@@ -7052,7 +7106,13 @@ async fn serve_peer_loop(
                                     forget_transaction_requests(peers, transaction);
                                 }
                                 if handle_received_block(
-                                    node, peer_id, block, requested, true, false,
+                                    node,
+                                    peer_id,
+                                    block,
+                                    requested,
+                                    true,
+                                    false,
+                                    Instant::now(),
                                 )
                                 .await?
                                 {
@@ -7309,6 +7369,7 @@ async fn serve_peer_loop(
                             pending.requested,
                             true,
                             false,
+                            Instant::now(),
                         )
                         .await?;
                         if accepted {
@@ -7552,6 +7613,12 @@ async fn serve_peer_loop(
                             txid,
                             transaction.compute_wtxid()
                         );
+                        // Core's functional tests and operators use this
+                        // rejection line as a synchronous diagnostic.  The
+                        // production logger is buffered, so make a peer
+                        // rejection visible before the handler continues
+                        // into orphan/package processing.
+                        crate::flush_debug_log();
                         let mut accepted_as_package = false;
                         let package_retryable = peer_package_retryable_error(&error);
                         if package_retryable {
@@ -8094,6 +8161,7 @@ async fn handle_received_block(
     requested: bool,
     enforce_unrequested_gate: bool,
     disconnect_on_invalid: bool,
+    received_at: Instant,
 ) -> Result<bool> {
     let hash = block.block_hash();
     if enforce_unrequested_gate && !requested {
@@ -8118,11 +8186,10 @@ async fn handle_received_block(
         };
         if header_work.is_none_or(|work| work < minimum_chain_work) {
             debug!(
-                %hash,
                 peer = peer_id,
                 header_work = ?header_work,
                 minimum_chain_work = ?minimum_chain_work,
-                "AcceptBlockHeader: not adding new block header, missing anti-dos proof-of-work validation"
+                "AcceptBlockHeader: not adding new block header {hash}, missing anti-dos proof-of-work validation"
             );
             return Ok(false);
         }
@@ -8137,6 +8204,7 @@ async fn handle_received_block(
                     .unwrap_or_default();
                 debug!("{hash}, {reject_reason}");
                 debug!(%hash, %error, reject_reason, "rejected unrequested block header");
+                crate::flush_debug_log();
                 let disconnect_for_header = matches!(
                     error.downcast_ref::<ValidationError>(),
                     Some(
@@ -8172,17 +8240,35 @@ async fn handle_received_block(
     // chain-mutation lane. Keeping the permit out of preparation lets all CPU
     // cores contribute without allowing competing chain writers to form a
     // lock convoy or deadlock with short peer/RPC chain readers.
+    let preparation_started = Instant::now();
     let (block, prepared) = tokio::task::spawn_blocking(move || {
         let prepared = crate::storage::BlockStore::prepare_record(&block)?;
         Ok::<_, anyhow::Error>((block, prepared))
     })
     .await
     .context("peer block preparation task failed")??;
-    let _peer_block_processing = node
-        .peer_block_processing
-        .acquire()
-        .await
-        .context("peer block processing gate closed")?;
+    let preparation_elapsed = preparation_started.elapsed();
+    let block_height = node
+        .chain
+        .read()
+        .block_height_by_hash(&hash)
+        .unwrap_or(u32::MAX);
+    let queue_wait_started = Instant::now();
+    let _peer_block_processing = node.peer_block_processing.acquire(block_height).await;
+    let queue_wait_elapsed = queue_wait_started.elapsed();
+    if queue_wait_elapsed >= Duration::from_secs(1) {
+        let active_tip_height = node.chain.try_read().map(|chain| chain.height());
+        info!(
+            %hash,
+            peer = peer_id,
+            height = block_height,
+            active_tip_height = ?active_tip_height,
+            preparation = ?preparation_elapsed,
+            queue_wait = ?queue_wait_elapsed,
+            received_to_gate = ?received_at.elapsed(),
+            "Slow peer block admission queue"
+        );
+    }
     let validation_node = Arc::clone(node);
     let result = tokio::task::spawn_blocking(move || {
         if disconnect_on_invalid {
@@ -8240,63 +8326,67 @@ fn handle_peer_block_validation_error(
     disconnect_on_invalid: bool,
     header_was_accepted: bool,
 ) -> Result<bool> {
+    let stored_block_error = error.downcast_ref::<crate::chain::StoredBlockValidationError>();
+    let error_hash = stored_block_error.map_or(hash, |error| error.block_hash);
+    let validation_error = error
+        .downcast_ref::<ValidationError>()
+        .or_else(|| stored_block_error.map(|error| &error.source));
     if is_node_expired_error(&error) {
-        debug!(%hash, "node-expired");
+        debug!(%error_hash, "node-expired");
     }
-    if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
+    if let Some(validation_error) = validation_error {
         let reject_reason = block_validation_log_reason(validation_error);
         debug!("Block validation error: {reject_reason}");
+        // Core's functional tests and operators commonly inspect this record
+        // immediately after the peer is disconnected. Keep the general log
+        // path asynchronous, but make this critical rejection diagnostic
+        // visible before returning to the peer loop.
+        crate::flush_debug_log();
     }
     let should_mark_invalid = header_was_accepted
-        && error
-            .downcast_ref::<ValidationError>()
-            .is_some_and(ValidationError::should_mark_block_invalid);
-    let rejected_body = error
-        .downcast_ref::<ValidationError>()
-        .is_some_and(|error| {
-            matches!(
-                error,
-                ValidationError::EmptyBlock
-                    | ValidationError::OversizedBlockBase
-                    | ValidationError::OversizedTransaction(_)
-                    | ValidationError::TooManySigops
-                    | ValidationError::BadCoinbase
-                    | ValidationError::FirstTransactionNotCoinbase
-                    | ValidationError::ExtraCoinbase(_)
-                    | ValidationError::NullPrevout(_)
-                    | ValidationError::EmptyInputs(_)
-                    | ValidationError::EmptyOutputs(_)
-                    | ValidationError::DuplicateInput(_)
-                    | ValidationError::DuplicateTransaction(_)
-                    | ValidationError::NegativeOutputValue(_)
-                    | ValidationError::BadOutputValue(_)
-                    | ValidationError::OutputTotalOverflow
-                    | ValidationError::BadMerkleRoot
-                    | ValidationError::BadWitnessNonceSize
-                    | ValidationError::BadWitnessMerkleMatch
-            )
-        });
-    let is_mutated = error
-        .downcast_ref::<ValidationError>()
-        .is_some_and(|error| {
-            matches!(
-                error,
-                ValidationError::BadMerkleRoot
-                    | ValidationError::BadWitnessNonceSize
-                    | ValidationError::BadWitnessMerkleMatch
-            )
-        });
+        && validation_error.is_some_and(ValidationError::should_mark_block_invalid);
+    let rejected_body = validation_error.is_some_and(|error| {
+        matches!(
+            error,
+            ValidationError::EmptyBlock
+                | ValidationError::OversizedBlockBase
+                | ValidationError::OversizedTransaction(_)
+                | ValidationError::TooManySigops
+                | ValidationError::BadCoinbase
+                | ValidationError::FirstTransactionNotCoinbase
+                | ValidationError::ExtraCoinbase(_)
+                | ValidationError::NullPrevout(_)
+                | ValidationError::EmptyInputs(_)
+                | ValidationError::EmptyOutputs(_)
+                | ValidationError::DuplicateInput(_)
+                | ValidationError::DuplicateTransaction(_)
+                | ValidationError::NegativeOutputValue(_)
+                | ValidationError::BadOutputValue(_)
+                | ValidationError::OutputTotalOverflow
+                | ValidationError::BadMerkleRoot
+                | ValidationError::BadWitnessNonceSize
+                | ValidationError::BadWitnessMerkleMatch
+        )
+    });
+    let is_mutated = validation_error.is_some_and(|error| {
+        matches!(
+            error,
+            ValidationError::BadMerkleRoot
+                | ValidationError::BadWitnessNonceSize
+                | ValidationError::BadWitnessMerkleMatch
+        )
+    });
     if should_mark_invalid {
-        if let Err(mark_error) = node.chain.write().mark_block_invalid(&hash) {
-            debug!(%hash, %mark_error, "failed to cache invalid peer block");
+        if let Err(mark_error) = node.chain.write().mark_block_invalid(&error_hash) {
+            debug!(%error_hash, %mark_error, "failed to cache invalid peer block");
         }
         node.refresh_large_work_invalid_chain_warning();
     }
     if rejected_body {
-        node.remember_rejected_block_body(hash);
+        node.remember_rejected_block_body(error_hash);
     }
     if disconnect_on_invalid && is_mutated {
-        if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
+        if let Some(validation_error) = validation_error {
             let reason = validation_error.bip22_reject_reason();
             let detail = if matches!(validation_error, ValidationError::BadMerkleRoot) {
                 "hashMerkleRoot mismatch"
@@ -8305,17 +8395,16 @@ fn handle_peer_block_validation_error(
             };
             debug!("Block mutated: {reason}, {detail}");
         }
-        anyhow::bail!("invalid peer block {hash}: {error}");
+        anyhow::bail!("invalid peer block {error_hash}: {error}");
     }
     if disconnect_on_invalid && (should_mark_invalid || rejected_body) {
-        anyhow::bail!("invalid peer block {hash}: {error}");
+        anyhow::bail!("invalid peer block {error_hash}: {error}");
     }
-    let reject_reason = error
-        .downcast_ref::<ValidationError>()
+    let reject_reason = validation_error
         .map(ValidationError::bip22_reject_reason)
         .unwrap_or_default();
-    debug!("{hash}, {reject_reason}");
-    debug!(%hash, %error, reject_reason, "rejected peer block");
+    debug!("{error_hash}, {reject_reason}");
+    debug!(%error_hash, %error, reject_reason, "rejected peer block");
     Ok(false)
 }
 
@@ -8330,9 +8419,9 @@ fn is_node_expired_error(error: &anyhow::Error) -> bool {
 fn block_validation_log_reason(error: &ValidationError) -> String {
     let reason = error.bip22_reject_reason();
     reason
-        .strip_prefix("block-script-verify-flag-failed")
+        .strip_prefix("mandatory-script-verify-flag-failed")
         .map_or(reason.clone(), |suffix| {
-            format!("mandatory-script-verify-flag-failed{suffix}")
+            format!("block-script-verify-flag-failed{suffix}")
         })
 }
 
@@ -8752,6 +8841,10 @@ fn advertised_local_address(node: &Node, peer: &PeerState, peer_id: usize) -> Op
         });
     if let Some(address) = address {
         debug!("Advertising address {address} to peer={peer_id}");
+        // Address self-announcements are protocol-visible events. Flush this
+        // rare diagnostic immediately so RPC/P2P tests and operators see the
+        // announcement before the peer proceeds with the next message.
+        crate::flush_debug_log();
     }
     address
 }
@@ -10752,6 +10845,19 @@ mod tests {
 
     use crate::config::OnlyNet;
     use crate::{Config, Node};
+
+    #[test]
+    fn block_script_reject_reason_uses_core_block_prefix() {
+        let error = ValidationError::Script {
+            txid: Txid::from_byte_array([7; 32]),
+            input: 0,
+            reason: "Witness provided for non-witness script".to_owned(),
+        };
+        assert_eq!(
+            block_validation_log_reason(&error),
+            "block-script-verify-flag-failed (Witness provided for non-witness script)"
+        );
+    }
 
     #[test]
     fn block_relay_cursor_tracks_the_last_announced_block() {

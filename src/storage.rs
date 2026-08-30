@@ -297,14 +297,17 @@ pub type StoredElectrumHistory = Vec<(Txid, u32)>;
 const UTXO_CACHE_SHARDS: usize = 384;
 
 struct UtxoReadCache {
-    // Generation zero marks entries loaded by the complete sequential warm.
-    // Those entries need no second copy of every outpoint in the FIFO queue.
-    entries: Vec<FastHashMap<OutPoint, (StoredUtxo, u64)>>,
-    order: VecDeque<(OutPoint, u64)>,
+    // The decoded cache is deliberately sharded so a complete warm can
+    // reserve each hash table independently. Do not keep an LRU/FIFO side
+    // table here: a second OutPoint for every resident coin is a substantial
+    // fraction of process memory at mainnet scale. Eviction rotates through
+    // the shards and removes arbitrary entries; this is a cache-only policy
+    // and cannot affect consensus or the authoritative LSM view.
+    entries: Vec<FastHashMap<OutPoint, StoredUtxo>>,
+    eviction_shard: usize,
     entry_count: usize,
     bytes: usize,
     limit: usize,
-    next_generation: u64,
     complete: bool,
 }
 
@@ -312,11 +315,10 @@ impl Default for UtxoReadCache {
     fn default() -> Self {
         Self {
             entries: (0..UTXO_CACHE_SHARDS).map(|_| FastHashMap::new()).collect(),
-            order: VecDeque::new(),
+            eviction_shard: 0,
             entry_count: 0,
             bytes: 0,
             limit: 0,
-            next_generation: 0,
             complete: false,
         }
     }
@@ -349,12 +351,7 @@ impl UtxoReadCache {
     }
 
     fn get_ref(&self, outpoint: &OutPoint) -> Option<&StoredUtxo> {
-        // Outputs are normally read once, immediately before being spent.
-        // FIFO retention avoids an O(cache size) LRU-list update in that hot
-        // path while still keeping recently created outputs resident.
-        self.entries[Self::shard_index(outpoint)]
-            .get(outpoint)
-            .map(|(entry, _)| entry)
+        self.entries[Self::shard_index(outpoint)].get(outpoint)
     }
 
     fn get(&self, outpoint: &OutPoint) -> Option<StoredUtxo> {
@@ -374,22 +371,19 @@ impl UtxoReadCache {
         // added; otherwise query_unresolved can skip a disk read and leave
         // consensus validation with an apparently prefetched miss.
         self.complete = false;
-        self.next_generation = self.next_generation.saturating_add(1).max(1);
-        let generation = self.next_generation;
         let shard = Self::shard_index(&outpoint);
-        if let Some((old_entry, _)) = self.entries[shard].insert(outpoint, (entry, generation)) {
+        if let Some(old_entry) = self.entries[shard].insert(outpoint, entry) {
             self.bytes = self.bytes.saturating_sub(read_cache_utxo_bytes(&old_entry));
         } else {
             self.entry_count = self.entry_count.saturating_add(1);
         }
         self.bytes = self.bytes.saturating_add(bytes);
-        self.order.push_back((outpoint, generation));
         self.trim();
     }
 
     /// Insert an entry discovered by a complete sequential database scan.
     /// It remains cache-resident until spent or until a later size trim needs
-    /// to reclaim stationary entries, without one FIFO record per coin.
+    /// to reclaim it.
     fn insert_stationary(&mut self, outpoint: OutPoint, entry: StoredUtxo) {
         let bytes = read_cache_utxo_bytes(&entry);
         if self.limit == 0 || bytes > self.limit {
@@ -397,7 +391,7 @@ impl UtxoReadCache {
             return;
         }
         let shard = Self::shard_index(&outpoint);
-        if let Some((old_entry, _)) = self.entries[shard].insert(outpoint, (entry, 0)) {
+        if let Some(old_entry) = self.entries[shard].insert(outpoint, entry) {
             self.bytes = self.bytes.saturating_sub(read_cache_utxo_bytes(&old_entry));
         } else {
             self.entry_count = self.entry_count.saturating_add(1);
@@ -407,11 +401,10 @@ impl UtxoReadCache {
 
     fn remove(&mut self, outpoint: &OutPoint) {
         let shard = Self::shard_index(outpoint);
-        if let Some((entry, _)) = self.entries[shard].remove(outpoint) {
+        if let Some(entry) = self.entries[shard].remove(outpoint) {
             self.bytes = self.bytes.saturating_sub(read_cache_utxo_bytes(&entry));
             self.entry_count = self.entry_count.saturating_sub(1);
         }
-        self.compact_order_if_needed();
     }
 
     fn clear(&mut self) {
@@ -423,10 +416,33 @@ impl UtxoReadCache {
         // allocator instead of retaining its peak capacity for the rest of
         // IBD.
         self.entries = (0..UTXO_CACHE_SHARDS).map(|_| FastHashMap::new()).collect();
-        self.order = VecDeque::new();
+        self.eviction_shard = 0;
         self.entry_count = 0;
         self.bytes = 0;
         self.complete = false;
+    }
+
+    /// Reserve the buckets needed by a bulk cache rebuild before inserting
+    /// entries. Large IBD checkpoints repopulate millions of recent coins
+    /// after replacing the cache; growing 384 hash tables incrementally
+    /// repeatedly allocates, copies, and frees bucket arrays while the chain
+    /// writer is held. Counting the target shard for each entry is a small
+    /// fixed-size pass and avoids that allocator churn without changing the
+    /// cache contents or eviction policy.
+    fn reserve_for_outpoints<'a, I>(&mut self, outpoints: I)
+    where
+        I: IntoIterator<Item = &'a OutPoint>,
+    {
+        let mut counts = [0usize; UTXO_CACHE_SHARDS];
+        for outpoint in outpoints {
+            let shard = Self::shard_index(outpoint);
+            counts[shard] = counts[shard].saturating_add(1);
+        }
+        for (shard, count) in self.entries.iter_mut().zip(counts) {
+            if count != 0 {
+                shard.reserve(count);
+            }
+        }
     }
 
     fn trim(&mut self) {
@@ -438,60 +454,30 @@ impl UtxoReadCache {
     /// cache, but retaining a small newest-output window is useful on the
     /// next IBD blocks and still leaves the normal budget accounting intact.
     fn trim_to(&mut self, limit: usize) {
-        while self.bytes > limit {
-            let Some((outpoint, generation)) = self.order.pop_front() else {
-                break;
+        if self.bytes <= limit {
+            return;
+        }
+        let target = limit.saturating_mul(7) / 8;
+        let shard_count = self.entries.len();
+        let mut empty_shards = 0usize;
+        while self.bytes > target && self.entry_count != 0 && empty_shards < shard_count {
+            let shard_index = self.eviction_shard % shard_count;
+            self.eviction_shard = self.eviction_shard.saturating_add(1) % shard_count;
+            let outpoint = self.entries[shard_index].keys().next().copied();
+            let Some(outpoint) = outpoint else {
+                empty_shards = empty_shards.saturating_add(1);
+                continue;
             };
-            let shard = Self::shard_index(&outpoint);
-            let is_current = self
-                .entries
-                .get(shard)
-                .and_then(|entries| entries.get(&outpoint))
-                .is_some_and(|(_, current)| *current == generation);
-            if is_current && let Some((entry, _)) = self.entries[shard].remove(&outpoint) {
+            if let Some(entry) = self.entries[shard_index].remove(&outpoint) {
                 self.bytes = self.bytes.saturating_sub(read_cache_utxo_bytes(&entry));
                 self.entry_count = self.entry_count.saturating_sub(1);
                 self.complete = false;
+                empty_shards = 0;
             }
         }
         if self.bytes > limit {
-            // A complete warm intentionally omits stationary entries from the
-            // FIFO. If chain growth eventually exceeds the configured limit,
-            // reclaim enough of them in one pass to leave useful headroom and
-            // avoid scanning the full map again on every subsequent insert.
-            let target = limit.saturating_mul(7) / 8;
-            let bytes = &mut self.bytes;
-            let entry_count = &mut self.entry_count;
-            for shard in &mut self.entries {
-                if *bytes <= target {
-                    break;
-                }
-                shard.retain(|_, (entry, generation)| {
-                    if *bytes > target && *generation == 0 {
-                        *bytes = bytes.saturating_sub(read_cache_utxo_bytes(entry));
-                        *entry_count = entry_count.saturating_sub(1);
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
             self.complete = false;
         }
-        self.compact_order_if_needed();
-    }
-
-    fn compact_order_if_needed(&mut self) {
-        let maximum_entries = self.len().saturating_mul(2).saturating_add(1_024);
-        if self.order.len() <= maximum_entries {
-            return;
-        }
-        let entries = &self.entries;
-        self.order.retain(|(outpoint, generation)| {
-            entries[Self::shard_index(outpoint)]
-                .get(outpoint)
-                .is_some_and(|(_, current)| current == generation)
-        });
     }
 }
 
@@ -500,13 +486,19 @@ fn stored_utxo_cache_bytes(entry: &StoredUtxo) -> usize {
 }
 
 // A resident decoded coin occupies more than its serialized value: the
-// sharded hash table stores the outpoint and generation, and the normal
-// insertion path also keeps one outpoint/generation pair in the FIFO queue.
+// sharded hash table stores the outpoint and its bucket/table overhead.
 // Core's DynamicMemoryUsage includes that container overhead. Charging it to
 // the cache budget prevents the native cache from reaching the byte limit
 // only after its allocator footprint has already grown far beyond it.
 const UTXO_CACHE_CONTAINER_OVERHEAD: usize = 96;
-const UTXO_PENDING_CONTAINER_OVERHEAD: usize = 32;
+// A pending coin is stored in a hashbrown table as an OutPoint key plus a
+// PendingUtxo value.  The previous 32-byte allowance covered only the map
+// bookkeeping and substantially understated the table's bucket/key/value
+// footprint once IBD accumulated millions of dirty entries.  Charge a
+// conservative per-entry slot allowance so the byte-based checkpoint fires
+// before the allocator has to grow a multi-gigabyte table; this follows Core's
+// DynamicMemoryUsage accounting more closely and avoids swap-driven stalls.
+const UTXO_PENDING_CONTAINER_OVERHEAD: usize = 96;
 
 fn read_cache_utxo_bytes(entry: &StoredUtxo) -> usize {
     stored_utxo_cache_bytes(entry).saturating_add(UTXO_CACHE_CONTAINER_OVERHEAD)
@@ -1077,6 +1069,13 @@ impl BlockStoreReader {
 pub struct BlockStore {
     path: PathBuf,
     file: File,
+    // Forward chainstate replay normally consumes block records in their
+    // append order. Keep a private buffered cursor for that path so IBD does
+    // not turn every block body into a separate positional NFS read. The
+    // ordinary serving reader and RPC path continue to use independent
+    // positional reads.
+    replay_reader: Option<BufReader<File>>,
+    replay_reader_cursor: u64,
     index_file: File,
     index: HashMap<BlockHash, Record>,
     serving_reader: BlockStoreReader,
@@ -1368,6 +1367,8 @@ impl BlockStore {
         Ok(Self {
             path,
             file,
+            replay_reader: None,
+            replay_reader_cursor: 0,
             index_file,
             index,
             serving_reader,
@@ -1452,6 +1453,8 @@ impl BlockStore {
         Ok(Self {
             path,
             file,
+            replay_reader: None,
+            replay_reader_cursor: 0,
             index_file,
             index,
             serving_reader,
@@ -1532,6 +1535,11 @@ impl BlockStore {
         self.block_cache.clear();
         self.block_cache_order.clear();
         self.block_cache_bytes = 0;
+    }
+
+    fn reset_replay_reader(&mut self) {
+        self.replay_reader = None;
+        self.replay_reader_cursor = 0;
     }
 
     fn flush_pending_block_data(&mut self) -> Result<()> {
@@ -1773,6 +1781,7 @@ impl BlockStore {
         if !self.allow_block_file_reopen {
             bail!("block store is read-only")
         }
+        self.reset_replay_reader();
         self.file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -1821,6 +1830,17 @@ impl BlockStore {
         prepared: PreparedBlockRecord,
     ) -> Result<BlockHash> {
         self.insert_prepared_with_sync(block, prepared, false)
+    }
+
+    /// Retain a bounded decoded copy of a peer body that was stored while its
+    /// parent was still missing. Headers-first IBD commonly receives a long
+    /// suffix before the validation lane can connect it; without this cache,
+    /// activating that suffix decodes every body from the NFS-backed append
+    /// file a second time. The normal block cache already has the Core-sized
+    /// `dbcache / 8` budget, so this does not create a second unbounded body
+    /// store and older entries are evicted by the existing LRU policy.
+    pub(crate) fn cache_peer_block(&mut self, block: &Block) {
+        self.cache_block(block.block_hash(), block.clone(), block.total_size());
     }
 
     fn insert_prepared_with_sync(
@@ -1930,6 +1950,47 @@ impl BlockStore {
             bail!("stored block hash does not match block index");
         }
         self.cache_block(*hash, block.clone(), bytes.len());
+        Ok(Some(block))
+    }
+
+    /// Read one block during a forward chainstate replay.
+    ///
+    /// Unlike [`Self::get`], this deliberately bypasses the decoded block LRU
+    /// and uses a buffered sequential cursor. Replay callers walk a known
+    /// active-chain path, so keeping the file cursor aligned with the next
+    /// record lets the kernel/NFS client perform useful readahead instead of
+    /// issuing one positional read for every block body. A discontinuity is
+    /// still handled correctly by the buffered reader's seek path.
+    pub(crate) fn get_for_replay(&mut self, hash: &BlockHash) -> Result<Option<Block>> {
+        let Some(record) = self.index.get(hash).copied() else {
+            return Ok(None);
+        };
+        self.flush_pending_io()?;
+        if self.replay_reader.is_none() {
+            let mut reader = BufReader::with_capacity(
+                BLOCK_REPLAY_READ_BUFFER_BYTES,
+                self.file.try_clone().context("cloning block replay file")?,
+            );
+            reader
+                .seek(SeekFrom::Start(0))
+                .context("seeking to the beginning of the block store")?;
+            self.replay_reader = Some(reader);
+            self.replay_reader_cursor = 0;
+        }
+        let bytes = read_storage_record_buffered(
+            self.replay_reader
+                .as_mut()
+                .expect("replay reader initialized above"),
+            &mut self.replay_reader_cursor,
+            record,
+            self.xor_key,
+            MAX_STORED_BLOCK_SIZE,
+            "block",
+        )?;
+        let block: Block = deserialize(&bytes).context("decoding stored block")?;
+        if block.block_hash() != *hash {
+            bail!("stored block hash does not match block index");
+        }
         Ok(Some(block))
     }
 
@@ -2067,6 +2128,9 @@ impl BlockStore {
             BLOCK_REPLAY_READ_BUFFER_BYTES,
             self.file.try_clone().context("cloning block replay file")?,
         );
+        reader
+            .seek(SeekFrom::Start(0))
+            .context("seeking to the beginning of the block store")?;
         let mut cursor = 0u64;
         let mut headers = Vec::with_capacity(records.len());
         for (hash, record) in records {
@@ -2121,6 +2185,7 @@ impl BlockStore {
             MAX_STORED_BLOCK_SIZE,
         )?;
         self.file = file;
+        self.reset_replay_reader();
         self.block_data_len = data_len;
         self.pending_block_data.clear();
         self.pending_index_data.clear();
@@ -3172,6 +3237,10 @@ pub struct ChainstateStore {
     index: HashMap<BlockHash, Record>,
     write_batch_limit: usize,
     pending_write_bytes: usize,
+    // Cache warming is the only caller that reads many deltas concurrently.
+    // Keep that pool owned by the store so the startup-only workers and their
+    // allocator arenas can be released before steady-state IBD begins.
+    read_pool: Option<rayon::ThreadPool>,
 }
 
 pub(crate) struct PreparedChainstateRecord {
@@ -3219,6 +3288,7 @@ impl ChainstateStore {
             index,
             write_batch_limit: 32 * 1024 * 1024,
             pending_write_bytes: 0,
+            read_pool: None,
         })
     }
 
@@ -3265,27 +3335,57 @@ impl ChainstateStore {
         let Some(record) = self.index.get(hash).copied() else {
             return Ok(None);
         };
-        let bytes = read_storage_record(
-            &self.file,
-            record,
-            XorKey::default(),
-            MAX_STORED_CHAINSTATE_DELTA_SIZE + 32,
-            "chainstate delta",
-        )?;
-        if bytes.len() < 32 {
-            bail!("stored chainstate delta is truncated");
+        read_chainstate_delta_record(&self.file, *hash, record).map(Some)
+    }
+
+    /// Read a bounded batch of immutable chainstate deltas concurrently.
+    /// Startup cache warming walks these records backwards and must still
+    /// process them in that order, but the records themselves are independent
+    /// positional reads. A small dedicated pool hides NFS latency while the
+    /// caller retains control of the batch size and memory bound.
+    pub(crate) fn get_many(&mut self, hashes: &[BlockHash]) -> Result<Vec<Option<Vec<u8>>>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
         }
-        let stored_hash = BlockHash::from_byte_array(
-            bytes[..32]
-                .try_into()
-                .expect("chainstate delta hash has fixed width"),
-        );
-        if stored_hash != *hash {
-            bail!("stored chainstate delta hash does not match its index");
+        if self.read_pool.is_none() {
+            let threads = thread::available_parallelism()
+                .map_or(8, usize::from)
+                .saturating_mul(8)
+                .clamp(16, 64);
+            self.read_pool = Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(|index| format!("chainstate-reader-{index}"))
+                    .build()
+                    .context("building bounded chainstate read pool")?,
+            );
         }
-        let payload = decode_storage_payload(&bytes[32..], MAX_STORED_CHAINSTATE_DELTA_SIZE)
-            .context("decoding compressed chainstate delta")?;
-        Ok(Some(payload))
+        let read_pool = self
+            .read_pool
+            .as_ref()
+            .expect("chainstate read pool initialized above");
+        let file = self
+            .file
+            .try_clone()
+            .context("cloning chainstate delta file for parallel read")?;
+        read_pool.install(|| {
+            hashes
+                .par_iter()
+                .map(|hash| {
+                    self.index
+                        .get(hash)
+                        .copied()
+                        .map(|record| read_chainstate_delta_record(&file, *hash, record))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    /// Release the startup-only parallel read workers after cache warming.
+    /// The steady-state IBD path uses the UTXO reader pool instead.
+    pub(crate) fn release_read_pool(&mut self) {
+        self.read_pool = None;
     }
 
     pub fn insert(&mut self, hash: BlockHash, payload: &[u8]) -> Result<()> {
@@ -3385,6 +3485,29 @@ impl ChainstateStore {
     }
 }
 
+fn read_chainstate_delta_record(file: &File, hash: BlockHash, record: Record) -> Result<Vec<u8>> {
+    let bytes = read_storage_record(
+        file,
+        record,
+        XorKey::default(),
+        MAX_STORED_CHAINSTATE_DELTA_SIZE + 32,
+        "chainstate delta",
+    )?;
+    if bytes.len() < 32 {
+        bail!("stored chainstate delta is truncated");
+    }
+    let stored_hash = BlockHash::from_byte_array(
+        bytes[..32]
+            .try_into()
+            .expect("chainstate delta hash has fixed width"),
+    );
+    if stored_hash != hash {
+        bail!("stored chainstate delta hash does not match its index");
+    }
+    decode_storage_payload(&bytes[32..], MAX_STORED_CHAINSTATE_DELTA_SIZE)
+        .context("decoding compressed chainstate delta")
+}
+
 impl Drop for ChainstateStore {
     fn drop(&mut self) {
         let _ = self.flush_pending_writes();
@@ -3408,13 +3531,20 @@ const DISK_INDEX_DEFAULT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 // this larger bound is specific to the native backend.
 const UTXO_DISK_CACHE_DEFAULT_BYTES: u64 = 128 * 1024 * 1024;
 const UTXO_DISK_CACHE_MIN_MIB: u64 = 128;
-const UTXO_DISK_CACHE_MAX_MIB: u64 = 1_024;
+// Keep the compressed LSM block cache below the decoded coin cache. The
+// latter already accounts for the IBD working set, while Fjall also needs
+// room for memtables and compaction buffers that are not included in its
+// cache-size setting. A roughly 682 MiB cache at `-dbcache=2048` retains more
+// of the random-read working set without recreating the multi-gigabyte
+// native-cache pressure seen with the earlier 1 GiB setting.
+const UTXO_DISK_CACHE_MAX_MIB: u64 = 768;
 const DISK_INDEX_DEFAULT_WRITE_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
-// Core's dbwrapper gives the coins LevelDB a quarter of -dbcache for its
-// write buffer (512 MiB at -dbcache=2048), while CCoinsViewDB still emits
-// bounded 64 MiB CDBBatch writes. Keep that distinction for the UTXO
-// keyspace; the smaller service indexes retain the 64 MiB default.
-const UTXO_DISK_WRITE_BUFFER_BYTES: u64 = 512 * 1024 * 1024;
+// Core's dbwrapper gives the coins LevelDB a substantial write buffer, while
+// CCoinsViewDB still emits bounded 64 MiB CDBBatch writes. Keep a smaller
+// native cap: Fjall may retain several partition memtables while flush and
+// compaction workers run, and those allocations are outside the decoded coin
+// cache accounting. The smaller service indexes retain the 64 MiB default.
+const UTXO_DISK_WRITE_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
 // Fjall's default 64 MiB target is too small for the UTXO workload.  With
 // that setting, the current lsm-tree compactor can refuse an L1->L2 repair
 // once the destination contains more than 50 target-sized segments.  That is
@@ -3422,8 +3552,13 @@ const UTXO_DISK_WRITE_BUFFER_BYTES: u64 = 512 * 1024 * 1024;
 // segments, so every point read had to probe a large fraction of the level.
 // Larger runs keep the same 4 KiB point-read blocks while reducing both the
 // number of files and the amount of overlap that a lookup must examine.
-const UTXO_PARTITION_MEMTABLE_BYTES: u32 = 256 * 1024 * 1024;
-const UTXO_PARTITION_COMPACTION_TARGET_BYTES: u32 = 256 * 1024 * 1024;
+const UTXO_PARTITION_MEMTABLE_BYTES: u32 = 128 * 1024 * 1024;
+const UTXO_PARTITION_COMPACTION_TARGET_BYTES: u32 = 128 * 1024 * 1024;
+// Fresh UTXO databases use high-byte prefix partitions. A point lookup then
+// probes only the LSM files for one eighth of the keyspace instead of every
+// segment in the monolithic coins tree. Existing single-partition databases
+// remain readable; new databases use the sharded layout.
+const UTXO_SHARD_COUNT: usize = 8;
 // Unsynced IBD writes are not a durability boundary: ChainState publishes its
 // store-tip markers only after flushing every store. Core keeps dirty coins in
 // the same byte budget as clean coins and normally flushes near 90% of that
@@ -3444,11 +3579,21 @@ const UTXO_PENDING_CAPACITY_GUARD_DENOMINATOR: usize = 8;
 // checkpoint. Core clears CCoinsViewCache::Flush completely; this native
 // cache is an intentional read-performance extension for the common IBD
 // pattern where the next blocks spend outputs from the recent suffix. Keep
-// enough of that suffix to approximate Core's immediately repopulated
-// multi-gigabyte coin cache instead of forcing every post-flush spend back to
-// the LSM over NFS.
+// as much of the existing clean cache as fits alongside that suffix instead
+// of discarding the entire decoded working set and turning the next window
+// into random LSM reads over NFS. The decoded cache's normal byte budget is
+// still the hard upper bound and remains separate from Fjall's compressed
+// block cache. Keep an additional cap below that budget so dirty UTXO state
+// can accumulate in larger batches instead of forcing a checkpoint as soon
+// as the retained clean cache reaches the full decoded-cache limit.
 const UTXO_POST_FLUSH_HOT_CACHE_BYTES: usize = 1_536 * 1024 * 1024;
-const UTXO_POST_FLUSH_HOT_CACHE_BLOCKS: u32 = 8_192;
+const UTXO_POST_FLUSH_HOT_CACHE_BLOCKS: u32 = 32_768;
+// A major compaction is deliberately kept out of the per-block IBD path: it
+// is a blocking rewrite of the live LSM tree. Run it at a durable snapshot
+// boundary once accumulated runs would otherwise make random point reads
+// probe too many files. The threshold is across all UTXO shards, so a fresh
+// mainnet chainstate can accumulate several normal runs per shard first.
+const UTXO_MAJOR_COMPACTION_SEGMENT_THRESHOLD: usize = 128;
 // Append-only service indexes remain item-batched; their values are small
 // and do not share the decoded UTXO coin-cache budget.
 const DISK_INDEX_MAX_PENDING_ITEMS: usize = 2_097_152;
@@ -3472,6 +3617,89 @@ fn utxo_partition_options() -> PartitionCreateOptions {
         .max_memtable_size(UTXO_PARTITION_MEMTABLE_BYTES)
 }
 
+/// The physical UTXO partitions behind one logical coin set. The one-element
+/// form is used for pre-sharding databases; fresh stores use eight partitions
+/// selected by the first byte of the serialized outpoint key.
+#[derive(Clone)]
+struct UtxoPartitions {
+    partitions: Arc<Vec<PartitionHandle>>,
+}
+
+struct UtxoSnapshots {
+    snapshots: Vec<Snapshot>,
+}
+
+impl UtxoPartitions {
+    fn new(partitions: Vec<PartitionHandle>) -> Self {
+        debug_assert!(!partitions.is_empty());
+        Self {
+            partitions: Arc::new(partitions),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PartitionHandle> {
+        self.partitions.iter()
+    }
+
+    fn len(&self) -> usize {
+        self.partitions.len()
+    }
+
+    fn partition_index(&self, key: &[u8]) -> usize {
+        if self.partitions.len() == 1 {
+            return 0;
+        }
+        let first = usize::from(key.first().copied().unwrap_or_default());
+        first.saturating_mul(self.partitions.len()) / 256
+    }
+
+    fn partition_for_key(&self, key: &[u8]) -> &PartitionHandle {
+        &self.partitions[self.partition_index(key)]
+    }
+
+    fn partition(&self, index: usize) -> &PartitionHandle {
+        &self.partitions[index]
+    }
+
+    fn get(&self, key: &[u8]) -> fjall::Result<Option<fjall::Slice>> {
+        self.partition_for_key(key).get(key)
+    }
+
+    fn contains_key(&self, key: &[u8]) -> fjall::Result<bool> {
+        self.partition_for_key(key).contains_key(key)
+    }
+
+    fn is_empty(&self) -> fjall::Result<bool> {
+        for partition in self.iter() {
+            if !partition.is_empty()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn snapshot(&self) -> UtxoSnapshots {
+        UtxoSnapshots {
+            snapshots: self.iter().map(PartitionHandle::snapshot).collect(),
+        }
+    }
+
+    fn segment_count(&self) -> usize {
+        self.iter().map(PartitionHandle::segment_count).sum()
+    }
+}
+
+impl UtxoSnapshots {
+    fn get(&self, key: &[u8]) -> fjall::Result<Option<fjall::Slice>> {
+        if self.snapshots.len() == 1 {
+            return self.snapshots[0].get(key).map_err(Into::into);
+        }
+        let first = usize::from(key.first().copied().unwrap_or_default());
+        let index = first.saturating_mul(self.snapshots.len()) / 256;
+        self.snapshots[index].get(key).map_err(Into::into)
+    }
+}
+
 /// Disk-backed UTXO set with a bounded decoded-value cache.
 ///
 /// Outpoints are stored directly in an LSM tree; only the configured database
@@ -3482,7 +3710,7 @@ pub struct UtxoStore {
     recovery_attempt_path: PathBuf,
     unsynced_marker_path: PathBuf,
     keyspace: Keyspace,
-    coins: PartitionHandle,
+    coins: Arc<UtxoPartitions>,
     metadata: PartitionHandle,
     entry_count: usize,
     generation: u64,
@@ -3555,8 +3783,8 @@ impl UtxoValidationView<'_> {
 /// chain lock is held; remaining point reads use either a Fjall snapshot or
 /// the current partition, depending on the caller.
 enum UtxoQuerySource {
-    Snapshot(Snapshot),
-    Latest(PartitionHandle),
+    Snapshot(UtxoSnapshots),
+    Latest(Arc<UtxoPartitions>),
 }
 
 pub struct UtxoQuery {
@@ -3565,7 +3793,12 @@ pub struct UtxoQuery {
     unresolved: Vec<OutPoint>,
 }
 
-const UTXO_PREFETCH_CHUNK: usize = 32_768;
+// Keep each prefetch wave bounded so a pathological block batch cannot turn
+// every input into a simultaneously allocated task/result. The result map is
+// retained until validation either way; two 262k waves cover the usual large
+// IBD block more efficiently than four 131k waves while keeping the decoded
+// working set and the reader pool bounded.
+const UTXO_PREFETCH_CHUNK: usize = 262_144;
 
 impl UtxoQuery {
     pub fn unresolved_len(&self) -> usize {
@@ -3649,17 +3882,17 @@ impl UtxoQuery {
         // slower sequence-number lookup. General callers can still request
         // the snapshot variant for a coherent point-in-time view.
         //
-        // Keep more outstanding reads than hardware threads: on the NFS
-        // chainstate used for IBD, a worker spends most of its time waiting
-        // for a bloom/index/value-block read. The upper bound is still
-        // deliberately finite so a large block cannot create an unbounded
-        // number of tasks or turn local-disk validation into scheduler work.
+        // Keep substantially more outstanding reads than hardware threads:
+        // on the NFS chainstate used for IBD, a worker spends most of its time
+        // waiting for a bloom/index/value-block read.  Sixty-four workers is
+        // enough to keep the remote store busy on the current 8-core host,
+        // while avoiding the allocator/thread pressure of larger pools.
         static READ_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
         let read_pool = READ_POOL.get_or_init(|| {
             let threads = thread::available_parallelism()
                 .map_or(8, usize::from)
                 .saturating_mul(8)
-                .clamp(16, 64);
+                .clamp(32, 64);
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .thread_name(|index| format!("utxo-reader-{index}"))
@@ -3673,10 +3906,10 @@ impl UtxoQuery {
                     let key = encode_outpoint(outpoint);
                     let bytes = match source {
                         UtxoQuerySource::Snapshot(snapshot) => {
-                            snapshot.get(key).context("reading UTXO value")?
+                            snapshot.get(&key).context("reading UTXO value")?
                         }
                         UtxoQuerySource::Latest(coins) => {
-                            coins.get(key).context("reading UTXO value")?
+                            coins.get(&key).context("reading UTXO value")?
                         }
                     };
                     let entry = bytes.map(|bytes| decode_stored_utxo(&bytes)).transpose()?;
@@ -3704,7 +3937,7 @@ impl UtxoStore {
             .and_then(|mib| u64::try_from(mib.max(0)).ok())
             .unwrap_or(UTXO_DISK_CACHE_MIN_MIB);
         cache_mib
-            .saturating_div(2)
+            .saturating_div(3)
             .clamp(UTXO_DISK_CACHE_MIN_MIB, UTXO_DISK_CACHE_MAX_MIB)
             .saturating_mul(1024 * 1024)
     }
@@ -3714,11 +3947,20 @@ impl UtxoStore {
         create_dir_all(directory)
             .with_context(|| format!("creating UTXO store {}", directory.display()))?;
         let path = directory.join("coins");
+        let legacy_partition_path = path.join("partitions").join(UTXO_PARTITION_NAME);
+        let sharded_partition_exists = (0..UTXO_SHARD_COUNT).any(|index| {
+            path.join("partitions")
+                .join(format!("{UTXO_PARTITION_NAME}-{index:02}"))
+                .exists()
+        });
         // A logically empty Fjall partition may still contain active
         // tombstones after a clear or a prior delete cycle.  Only a keyspace
         // that did not exist before this open is eligible for bulk_ingest;
-        // this keeps the one-shot path safe across restarts as well.
-        let keyspace_was_new = !path.exists();
+        // this keeps the one-shot path safe across restarts as well. New
+        // keyspaces are opened with eight prefix partitions; an existing
+        // legacy keyspace stays on its single partition until explicitly
+        // rebuilt.
+        let keyspace_was_new = !legacy_partition_path.exists() && !sharded_partition_exists;
         let recovery_marker_path = directory.join("utxos.recovery.pending");
         let unsynced_marker_path = directory.join("utxos.unsynced.pending");
         // Unsynced chunk commits are protected by this marker. A process or
@@ -3734,20 +3976,43 @@ impl UtxoStore {
             remove_file(&unsynced_marker_path)
                 .context("removing interrupted unsynced UTXO marker")?;
         }
+        // Fjall's per-worker flush/compaction buffers are independent of the
+        // decoded UTXO cache budget. Cap the worker count so a high-core host
+        // cannot multiply the partition memtable footprint into several GiB
+        // during IBD; script validation and UTXO reads have their own larger
+        // CPU pools.
         let storage_workers = thread::available_parallelism()
-            .map_or(4, usize::from)
-            .clamp(4, 16);
+            .map_or(2, usize::from)
+            .clamp(2, 4);
         let keyspace = FjallConfig::new(&path)
             .cache_size(cache_bytes.max(1024 * 1024))
             .max_write_buffer_size(UTXO_DISK_WRITE_BUFFER_BYTES)
             .flush_workers(storage_workers)
-            .compaction_workers(storage_workers)
+            // Core's LevelDB chainstate runs one background compaction at a
+            // time. Multiple concurrent Fjall compactions compete with the
+            // random UTXO point reads on NFS and, in a controlled experiment,
+            // reduced warm IBD throughput despite shortening one compaction.
+            .compaction_workers(1)
             .manual_journal_persist(true)
             .open()
             .with_context(|| format!("opening disk-backed UTXO database {}", path.display()))?;
-        let coins = keyspace
-            .open_partition(UTXO_PARTITION_NAME, utxo_partition_options())
-            .context("opening UTXO partition")?;
+        let coins = if legacy_partition_path.exists() {
+            vec![
+                keyspace
+                    .open_partition(UTXO_PARTITION_NAME, utxo_partition_options())
+                    .context("opening legacy UTXO partition")?,
+            ]
+        } else {
+            (0..UTXO_SHARD_COUNT)
+                .map(|index| {
+                    let name = format!("{UTXO_PARTITION_NAME}-{index:02}");
+                    keyspace
+                        .open_partition(&name, utxo_partition_options())
+                        .with_context(|| format!("opening UTXO partition {name}"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let coins = Arc::new(UtxoPartitions::new(coins));
         let metadata = keyspace
             .open_partition(
                 UTXO_META_PARTITION_NAME,
@@ -3769,13 +4034,15 @@ impl UtxoStore {
                 generation
             }
         };
-        let mut read_cache = UtxoReadCache::default();
+        let read_cache = UtxoReadCache {
+            complete: entry_count == 0,
+            ..UtxoReadCache::default()
+        };
         // A newly created empty store is already a complete cache. Every
         // subsequent pending mutation is consulted before the cache and is
         // folded into it at flush, so fresh IBD can answer BIP30's many
         // negative existence checks without one LSM lookup per transaction
         // output. Any capacity eviction clears this invariant in `trim`.
-        read_cache.complete = entry_count == 0;
         Ok(Self {
             recovery_marker_path,
             recovery_attempt_path: directory.join("utxos.recovery.attempted"),
@@ -4026,9 +4293,11 @@ impl UtxoStore {
         }
         cache.clear();
         cache.reserve(self.entry_count);
-        for item in self.coins.iter() {
-            let (key, value) = item.context("scanning UTXO database for cache warming")?;
-            cache.insert_stationary(decode_outpoint(&key)?, decode_stored_utxo(&value)?);
+        for partition in self.coins.iter() {
+            for item in partition.iter() {
+                let (key, value) = item.context("scanning UTXO database for cache warming")?;
+                cache.insert_stationary(decode_outpoint(&key)?, decode_stored_utxo(&value)?);
+            }
         }
         // Startup recovery can connect a durable block suffix without
         // immediately flushing its UTXO batch. The pending map is the
@@ -4081,16 +4350,22 @@ impl UtxoStore {
         if cache.bytes >= target_bytes {
             return Ok((cache.len(), cache.bytes));
         }
-        for item in self.coins.iter() {
+        for partition in self.coins.iter() {
+            for item in partition.iter() {
+                if cache.bytes >= target_bytes {
+                    break;
+                }
+                let (key, value) =
+                    item.context("scanning UTXO database for partial cache warming")?;
+                let outpoint = decode_outpoint(&key)?;
+                if self.pending.contains_key(&outpoint) || cache.contains_key(&outpoint) {
+                    continue;
+                }
+                cache.insert_stationary(outpoint, decode_stored_utxo(&value)?);
+            }
             if cache.bytes >= target_bytes {
                 break;
             }
-            let (key, value) = item.context("scanning UTXO database for partial cache warming")?;
-            let outpoint = decode_outpoint(&key)?;
-            if self.pending.contains_key(&outpoint) || cache.contains_key(&outpoint) {
-                continue;
-            }
-            cache.insert_stationary(outpoint, decode_stored_utxo(&value)?);
         }
         cache.complete = false;
         Ok((cache.len(), cache.bytes))
@@ -4109,7 +4384,7 @@ impl UtxoStore {
         }
         drop(read_cache);
         self.coins
-            .contains_key(encode_outpoint(outpoint))
+            .contains_key(&encode_outpoint(outpoint))
             .context("looking up UTXO key")
     }
 
@@ -4159,7 +4434,7 @@ impl UtxoStore {
         drop(read_cache);
         let Some(bytes) = self
             .coins
-            .get(encode_outpoint(outpoint))
+            .get(&encode_outpoint(outpoint))
             .context("reading UTXO value")?
         else {
             return f(None);
@@ -4249,14 +4524,13 @@ impl UtxoStore {
     }
 
     pub fn entries(&self) -> Result<Vec<(OutPoint, StoredUtxo)>> {
-        let mut entries = self
-            .coins
-            .iter()
-            .map(|item| {
+        let mut entries = FastHashMap::new();
+        for partition in self.coins.iter() {
+            for item in partition.iter() {
                 let (key, value) = item.context("scanning UTXO database")?;
-                Ok((decode_outpoint(&key)?, decode_stored_utxo(&value)?))
-            })
-            .collect::<Result<FastHashMap<_, _>>>()?;
+                entries.insert(decode_outpoint(&key)?, decode_stored_utxo(&value)?);
+            }
+        }
         for (outpoint, entry) in &self.pending {
             if let Some(entry) = entry.entry.as_ref() {
                 entries.insert(*outpoint, entry.clone());
@@ -4267,6 +4541,112 @@ impl UtxoStore {
         let mut entries = entries.into_iter().collect::<Vec<_>>();
         entries.sort_unstable_by_key(|(outpoint, _)| encode_outpoint(outpoint));
         Ok(entries)
+    }
+
+    /// Visit the effective UTXO set in serialized outpoint order without
+    /// materializing the whole database.  The ordinary `entries` method is
+    /// useful to callers that need ownership, but using it for statistics on
+    /// mainnet would allocate one decoded value for every live coin before a
+    /// second sort allocation.
+    pub fn for_each_entry_sorted<F>(&self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(OutPoint, &StoredUtxo) -> Result<()>,
+    {
+        // Fjall partitions cover contiguous first-byte ranges of the
+        // serialized outpoint key. Sort only the pending overlay, then merge
+        // each small overlay shard with its on-disk partition. This preserves
+        // the same ordering as `entries` while keeping decoded disk values
+        // alive for one callback at a time.
+        let mut pending_by_partition = (0..self.coins.len())
+            .map(|_| Vec::<OutPoint>::new())
+            .collect::<Vec<_>>();
+        for outpoint in self.pending.keys().copied() {
+            let key = encode_outpoint(&outpoint);
+            let partition = self.coins.partition_index(&key);
+            pending_by_partition[partition].push(outpoint);
+        }
+        for pending in &mut pending_by_partition {
+            pending.sort_unstable_by_key(encode_outpoint);
+        }
+
+        for (partition_index, partition) in self.coins.iter().enumerate() {
+            let pending = &pending_by_partition[partition_index];
+            let mut pending_index = 0usize;
+            let mut disk_iter = partition.iter();
+            let mut disk_item = disk_iter
+                .next()
+                .transpose()
+                .context("scanning UTXO database")?;
+
+            loop {
+                let Some(pending_outpoint) = pending.get(pending_index).copied() else {
+                    let Some((key, value)) = disk_item.take() else {
+                        break;
+                    };
+                    let outpoint = decode_outpoint(&key)?;
+                    // An overlay key in this partition would compare equal
+                    // above, so a disk-only value can be emitted directly.
+                    let entry = decode_stored_utxo(&value)?;
+                    callback(outpoint, &entry)?;
+                    disk_item = disk_iter
+                        .next()
+                        .transpose()
+                        .context("scanning UTXO database")?;
+                    continue;
+                };
+                let pending_key = encode_outpoint(&pending_outpoint);
+                let Some((disk_key, _)) = disk_item.as_ref() else {
+                    for outpoint in &pending[pending_index..] {
+                        if let Some(entry) = self
+                            .pending
+                            .get(outpoint)
+                            .and_then(|pending| pending.entry.as_ref())
+                        {
+                            callback(*outpoint, entry)?;
+                        }
+                    }
+                    break;
+                };
+
+                match disk_key.as_ref().cmp(pending_key.as_ref()) {
+                    std::cmp::Ordering::Less => {
+                        let (key, value) = disk_item.take().expect("disk item was present");
+                        let outpoint = decode_outpoint(&key)?;
+                        let entry = decode_stored_utxo(&value)?;
+                        callback(outpoint, &entry)?;
+                        disk_item = disk_iter
+                            .next()
+                            .transpose()
+                            .context("scanning UTXO database")?;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if let Some(entry) = self
+                            .pending
+                            .get(&pending_outpoint)
+                            .and_then(|pending| pending.entry.as_ref())
+                        {
+                            callback(pending_outpoint, entry)?;
+                        }
+                        pending_index = pending_index.saturating_add(1);
+                        disk_item = disk_iter
+                            .next()
+                            .transpose()
+                            .context("scanning UTXO database")?;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        if let Some(entry) = self
+                            .pending
+                            .get(&pending_outpoint)
+                            .and_then(|pending| pending.entry.as_ref())
+                        {
+                            callback(pending_outpoint, entry)?;
+                        }
+                        pending_index = pending_index.saturating_add(1);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn apply_batch(
@@ -4548,9 +4928,10 @@ impl UtxoStore {
                 self.pending_covers_all || cache.complete,
                 // The item limit is an emergency guard for allocator and
                 // hash-table overhead that the payload estimate cannot see.
-                // It is still a full-cache checkpoint: retaining the flushed
-                // entries in `read_cache` would immediately recreate the
-                // memory pressure that caused the emergency flush.
+                // It is still a full-cache checkpoint, but the decoded cache
+                // has an explicit byte budget. Retain a bounded hot portion
+                // of it so the next IBD window does not become a cold LSM
+                // read storm after every checkpoint.
                 cache.bytes.saturating_add(self.pending_bytes) >= self.pending_limit_bytes
                     || self.pending.len() >= self.pending_item_limit,
             )
@@ -4664,17 +5045,42 @@ impl UtxoStore {
             }
             self.mark_unsynced_pending()?;
             let ingest_started = Instant::now();
-            self.coins
-                .ingest(ordered_pending.iter().map(|(outpoint, pending)| {
-                    let entry = pending
-                        .entry
-                        .as_ref()
-                        .expect("bulk UTXO ingest preflight guarantees a coin");
-                    let value = encode_stored_utxo(entry)
-                        .expect("bulk UTXO ingest preflight guarantees encodability");
-                    (encode_outpoint(outpoint).to_vec(), value)
-                }))
-                .context("bulk-ingesting initial UTXO database")?;
+            let mut pending_by_partition: Vec<Vec<(&OutPoint, &PendingUtxo)>> =
+                (0..self.coins.len()).map(|_| Vec::new()).collect();
+            for (outpoint, pending) in &ordered_pending {
+                let key = encode_outpoint(outpoint);
+                let index = self.coins.partition_index(&key);
+                pending_by_partition[index].push((outpoint, pending));
+            }
+            // The prefix shards are independent LSM trees. Ingest them in
+            // parallel so a fresh replay spends the available CPU and NFS
+            // bandwidth on eight sequential key streams instead of paying
+            // the full wall-clock cost of each shard one after another.
+            let coins = self.coins.clone();
+            let ingest_results = pending_by_partition
+                .into_par_iter()
+                .enumerate()
+                .filter_map(|(index, partition_pending)| {
+                    (!partition_pending.is_empty()).then_some((index, partition_pending))
+                })
+                .map(|(index, partition_pending)| {
+                    coins
+                        .partition(index)
+                        .ingest(partition_pending.into_iter().map(|(outpoint, pending)| {
+                            let entry = pending
+                                .entry
+                                .as_ref()
+                                .expect("bulk UTXO ingest preflight guarantees a coin");
+                            let value = encode_stored_utxo(entry)
+                                .expect("bulk UTXO ingest preflight guarantees encodability");
+                            (encode_outpoint(outpoint).to_vec(), value)
+                        }))
+                        .context("bulk-ingesting initial UTXO database")
+                })
+                .collect::<Vec<_>>();
+            for result in ingest_results {
+                result?;
+            }
             ingest_elapsed = ingest_started.elapsed();
 
             let mut batch = self
@@ -4723,10 +5129,11 @@ impl UtxoStore {
                     )
                     .durability((sync && final_batch).then_some(PersistMode::SyncData));
                     for (key, entry) in encoded {
+                        let partition = self.coins.partition(self.coins.partition_index(&key));
                         if let Some(entry) = entry {
-                            batch.insert(&self.coins, key, entry);
+                            batch.insert(partition, key, entry);
                         } else {
-                            batch.remove(&self.coins, key);
+                            batch.remove(partition, key);
                         }
                     }
                     if final_batch {
@@ -4782,11 +5189,13 @@ impl UtxoStore {
         self.pending_bytes = 0;
         let mut read_cache = self.read_cache.lock();
         if cache_was_large {
-            // Match Core's large-checkpoint behavior for the bulk of the
-            // decoded map, but retain a bounded suffix of newly created live
-            // outputs. The suffix is selected by coin height, then inserted
-            // oldest-to-newest so FIFO trimming keeps the newest entries.
-            read_cache.clear();
+            // Match Core's large-checkpoint memory bound while retaining the
+            // existing clean working set alongside a bounded hot portion of
+            // the newest pending outputs. The pending map is moved below, so
+            // evict enough clean entries first to make the final cache fit;
+            // this avoids both a cold post-flush read storm and a temporary
+            // duplicate decoded cache.
+            let hot_cache_limit = UTXO_POST_FLUSH_HOT_CACHE_BYTES.min(read_cache.limit);
             let newest_height = pending
                 .values()
                 .filter_map(|pending| pending.entry.as_ref().map(|entry| entry.height))
@@ -4803,11 +5212,25 @@ impl UtxoStore {
                     })
                     .collect::<Vec<_>>();
                 recent.sort_unstable_by_key(|(_, entry)| entry.height);
-                for (outpoint, entry) in recent {
-                    read_cache.insert(outpoint, entry);
+                let recent_bytes = recent.iter().fold(0usize, |bytes, (_, entry)| {
+                    bytes.saturating_add(read_cache_utxo_bytes(entry))
+                });
+                if recent_bytes >= hot_cache_limit {
+                    read_cache.clear();
+                } else {
+                    read_cache.trim_to(hot_cache_limit.saturating_sub(recent_bytes));
                 }
-                let hot_cache_limit = UTXO_POST_FLUSH_HOT_CACHE_BYTES.min(read_cache.limit);
+                read_cache.complete = false;
+                read_cache.reserve_for_outpoints(recent.iter().map(|(outpoint, _)| outpoint));
+                for (outpoint, entry) in recent {
+                    // The bulk rebuild trims once after all entries are
+                    // installed. Using the incremental insertion path here
+                    // would re-check the full cache limit for every coin.
+                    read_cache.insert_stationary(outpoint, entry);
+                }
                 read_cache.trim_to(hot_cache_limit);
+            } else {
+                read_cache.complete = false;
             }
         } else {
             for (outpoint, pending) in pending {
@@ -4879,15 +5302,33 @@ impl UtxoStore {
 
     pub fn compact(&mut self) -> Result<()> {
         self.flush()?;
-        self.coins
-            .major_compact()
-            .context("compacting UTXO database")
+        for partition in self.coins.iter() {
+            partition
+                .major_compact()
+                .context("compacting UTXO database")?;
+        }
+        Ok(())
     }
 
     pub fn compact_if_needed(&mut self) -> Result<bool> {
-        // Fjall performs leveled background compaction and reclaims
-        // tombstoned entries without materializing the keyspace.
-        Ok(false)
+        let segments = self.coins.segment_count();
+        if segments < UTXO_MAJOR_COMPACTION_SEGMENT_THRESHOLD {
+            return Ok(false);
+        }
+        let started = Instant::now();
+        tracing::info!(
+            segments,
+            threshold = UTXO_MAJOR_COMPACTION_SEGMENT_THRESHOLD,
+            "Starting major UTXO compaction"
+        );
+        self.compact()?;
+        tracing::info!(
+            segments_before = segments,
+            segments_after = self.coins.segment_count(),
+            elapsed = ?started.elapsed(),
+            "Completed major UTXO compaction"
+        );
+        Ok(true)
     }
 
     pub fn clear(&mut self) -> Result<()> {
@@ -4900,21 +5341,22 @@ impl UtxoStore {
         // tombstones in its active memtable, so it is not a bulk-ingest
         // target until a future open establishes a truly empty tree.
         self.bulk_ingest_eligible = false;
-        loop {
-            let keys = self
-                .coins
-                .keys()
-                .take(10_000)
-                .map(|key| key.map(|key| key.to_vec()))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if keys.is_empty() {
-                break;
+        for partition in self.coins.iter() {
+            loop {
+                let keys = partition
+                    .keys()
+                    .take(10_000)
+                    .map(|key| key.map(|key| key.to_vec()))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                if keys.is_empty() {
+                    break;
+                }
+                let mut batch = self.keyspace.batch();
+                for key in keys {
+                    batch.remove(partition, key);
+                }
+                batch.commit()?;
             }
-            let mut batch = self.keyspace.batch();
-            for key in keys {
-                batch.remove(&self.coins, key);
-            }
-            batch.commit()?;
         }
         self.entry_count = 0;
         self.pending_covers_all = true;
@@ -7155,15 +7597,15 @@ mod tests {
         assert_eq!(mib(UtxoStore::recommended_disk_cache_bytes(Some(4))), 128);
         assert_eq!(
             mib(UtxoStore::recommended_disk_cache_bytes(Some(1_024))),
-            512
+            341
         );
         assert_eq!(
             mib(UtxoStore::recommended_disk_cache_bytes(Some(2_048))),
-            1_024
+            682
         );
         assert_eq!(
             mib(UtxoStore::recommended_disk_cache_bytes(Some(8_192))),
-            1_024
+            768
         );
     }
 
@@ -7315,6 +7757,7 @@ mod tests {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(true)
             .open(path.with_extension("index"))
             .unwrap();
         rewrite_index(
@@ -7511,6 +7954,7 @@ mod tests {
             let mut store = BlockStore::open(directory.path()).unwrap();
             let hash = store.insert(&block).unwrap();
             assert_eq!(store.get(&hash).unwrap().unwrap(), block);
+            assert_eq!(store.get_for_replay(&hash).unwrap(), Some(block.clone()));
             hash
         };
         let index_path = directory.path().join("blocks.index");
@@ -7519,6 +7963,7 @@ mod tests {
         let mut reopened = BlockStore::open(directory.path()).unwrap();
         assert!(reopened.contains(&hash));
         assert_eq!(reopened.get(&hash).unwrap().unwrap(), block);
+        assert_eq!(reopened.get_for_replay(&hash).unwrap(), Some(block));
     }
 
     #[test]
@@ -7557,6 +8002,68 @@ mod tests {
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened.get(&first).unwrap(), None);
         assert_eq!(reopened.get(&second).unwrap(), Some(second_entry));
+    }
+
+    #[test]
+    fn streaming_utxo_entries_merge_pending_overlay_in_key_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let second = OutPoint::new(Txid::from_byte_array([1; 32]), 1);
+        let third = OutPoint::new(Txid::from_byte_array([128; 32]), 0);
+        let replacement = OutPoint::new(Txid::from_byte_array([255; 32]), 0);
+        let entry = |value, height| StoredUtxo {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(value),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            },
+            height,
+            median_time_past: height,
+            coinbase: false,
+        };
+        let first_entry = entry(1_000, 1);
+        let second_entry = entry(2_000, 2);
+        let third_entry = entry(3_000, 3);
+        let replacement_entry = entry(4_000, 4);
+        let mut store = UtxoStore::open(directory.path()).unwrap();
+        store
+            .apply_batch(
+                &[],
+                &[
+                    (first, first_entry.clone()),
+                    (second, second_entry),
+                    (third, third_entry),
+                ],
+            )
+            .unwrap();
+        store
+            .apply_batch_unsynced(
+                &[first],
+                &[
+                    (replacement, replacement_entry.clone()),
+                    (first, first_entry),
+                ],
+            )
+            .unwrap();
+
+        let expected = store.entries().unwrap();
+        let mut streamed = Vec::new();
+        store
+            .for_each_entry_sorted(|outpoint, entry| {
+                streamed.push((outpoint, entry.clone()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(streamed, expected);
+
+        store.flush().unwrap();
+        let mut reopened_streamed = Vec::new();
+        store
+            .for_each_entry_sorted(|outpoint, entry| {
+                reopened_streamed.push((outpoint, entry.clone()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reopened_streamed, expected);
     }
 
     #[test]
@@ -7666,6 +8173,47 @@ mod tests {
         assert_eq!(store.coins.segment_count(), 1);
         assert_eq!(store.get(&first).unwrap(), Some(first_entry));
         assert_eq!(store.get(&second).unwrap(), Some(second_entry));
+    }
+
+    #[test]
+    fn fresh_utxo_store_uses_prefix_partitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = |height| StoredUtxo {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            },
+            height,
+            median_time_past: height,
+            coinbase: false,
+        };
+        // Pick one key from every high-byte range. This exercises every
+        // independent bulk-ingest worker instead of only checking that the
+        // first and last shards exist.
+        let entries = (0..UTXO_SHARD_COUNT)
+            .map(|partition| {
+                let first_byte = (partition as u8) * 32;
+                (
+                    OutPoint::new(Txid::from_byte_array([first_byte; 32]), partition as u32),
+                    entry(partition as u32 + 1),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut store = UtxoStore::open(directory.path()).unwrap();
+        assert_eq!(store.coins.len(), UTXO_SHARD_COUNT);
+        store.apply_validated_batch_unsynced(&[], &entries).unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.coins.segment_count(), UTXO_SHARD_COUNT);
+        for (outpoint, expected) in &entries {
+            assert_eq!(store.get(outpoint).unwrap(), Some(expected.clone()));
+        }
+
+        let reopened = UtxoStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.coins.len(), UTXO_SHARD_COUNT);
+        for (outpoint, expected) in entries {
+            assert_eq!(reopened.get(&outpoint).unwrap(), Some(expected));
+        }
     }
 
     #[test]
@@ -7799,12 +8347,10 @@ mod tests {
                 },
             );
         }
-        assert!(cache.order.is_empty());
         assert!(cache.bytes > cache.limit);
         cache.complete = true;
 
         cache.trim();
-        assert!(cache.order.is_empty());
         assert!(!cache.complete);
         assert!(cache.bytes <= cache.limit.saturating_mul(7) / 8);
         assert_eq!(
@@ -7817,7 +8363,7 @@ mod tests {
                 .entries
                 .iter()
                 .flat_map(FastHashMap::values)
-                .map(|(entry, _)| read_cache_utxo_bytes(entry))
+                .map(read_cache_utxo_bytes)
                 .sum::<usize>()
         );
     }
@@ -8457,6 +9003,21 @@ mod tests {
     }
 
     #[test]
+    fn unsynced_peer_body_can_be_reused_from_decoded_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        let mut store = BlockStore::open(directory.path()).unwrap();
+        store.configure_cache_size_mib(4);
+        let prepared = BlockStore::prepare_record(&block).unwrap();
+        store.insert_prepared_unsynced(&block, prepared).unwrap();
+        store.cache_peer_block(&block);
+
+        assert_eq!(store.block_cache.len(), 1);
+        assert_eq!(store.get(&hash).unwrap(), Some(block));
+    }
+
+    #[test]
     fn native_block_store_does_not_create_core_block_files() {
         let directory = tempfile::tempdir().unwrap();
         let block = genesis_block(Network::Regtest);
@@ -8896,11 +9457,20 @@ mod tests {
     fn persists_and_recovers_chainstate_deltas() {
         let directory = tempfile::tempdir().unwrap();
         let hash = BlockHash::from_byte_array([6; 32]);
+        let second_hash = BlockHash::from_byte_array([7; 32]);
         let payload = vec![1, 2, 3, 4, 5];
+        let second_payload = vec![6, 7, 8];
         {
             let mut store = ChainstateStore::open(directory.path()).unwrap();
             store.insert(hash, &payload).unwrap();
+            store.insert(second_hash, &second_payload).unwrap();
             assert_eq!(store.get(&hash).unwrap(), Some(payload.clone()));
+            assert_eq!(
+                store
+                    .get_many(&[hash, second_hash, BlockHash::from_byte_array([8; 32])])
+                    .unwrap(),
+                vec![Some(payload.clone()), Some(second_payload.clone()), None]
+            );
         }
         let data_path = directory.path().join("deltas.dat");
         let original_len = std::fs::metadata(&data_path).unwrap().len();

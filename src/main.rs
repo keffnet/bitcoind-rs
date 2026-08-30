@@ -122,7 +122,25 @@ fn run() -> Result<()> {
         None
     };
     let mut readiness = DaemonReadyGuard::new(readiness);
+    // Tokio's default worker count is based on host CPU discovery and can
+    // exceed the CPUs actually available to this process (on this host it
+    // creates 64 workers for an 8-CPU affinity set).  Async peer tasks do not
+    // need one executor worker per connection; use the effective process
+    // parallelism so the workers that run chain mutation and I/O do not
+    // compete with dozens of idle thread stacks.
+    let runtime_threads = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(8);
+    // Peer block preparation uses Tokio's blocking pool for serialization and
+    // compression. The default pool limit is intentionally very high for
+    // file-I/O-heavy applications, but these jobs are mostly CPU work and
+    // arrive in a bounded 64-block queue. Four workers per effective core
+    // keeps enough overlap for storage latency while preventing one worker
+    // per queued block on small hosts.
+    let blocking_threads = runtime_threads.saturating_mul(4).clamp(16, 64);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(runtime_threads)
+        .max_blocking_threads(blocking_threads)
         .enable_all()
         .build()
     {
@@ -183,6 +201,12 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     } else {
         (BoxMakeWriter::new(std::io::sink), None)
     };
+    if let Some(log_file) = &log_file {
+        let log_handle = log_file.handle();
+        bitcoind_rs::install_debug_log_flush_hook(move || {
+            let _ = log_handle.flush();
+        });
+    }
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -553,7 +577,6 @@ const ASYNC_LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 enum AsyncLogCommand {
     Write(Vec<u8>),
     Reopen,
-    #[cfg(test)]
     Flush(mpsc::Sender<io::Result<()>>),
     Shutdown(mpsc::Sender<io::Result<()>>),
 }
@@ -674,7 +697,6 @@ impl AsyncLogFileHandle {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "debug log worker stopped"))
     }
 
-    #[cfg(test)]
     fn flush(&self) -> io::Result<()> {
         let (sender, receiver) = mpsc::channel();
         self.state
@@ -736,19 +758,16 @@ fn async_log_worker(
                     Err(error) => record_async_log_error(&state, error),
                 }
             }
-            #[cfg(test)]
             AsyncLogCommand::Flush(reply) => {
-                let result = file.flush().map_err(|error| {
+                let result = file.flush().inspect_err(|error| {
                     record_async_log_error(&state, io::Error::other(error.to_string()));
-                    error
                 });
                 last_flush = Instant::now();
                 let _ = reply.send(result);
             }
             AsyncLogCommand::Shutdown(reply) => {
-                let result = file.flush().map_err(|error| {
+                let result = file.flush().inspect_err(|error| {
                     record_async_log_error(&state, io::Error::other(error.to_string()));
-                    error
                 });
                 let _ = reply.send(result);
                 break;

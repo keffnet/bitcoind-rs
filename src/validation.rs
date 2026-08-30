@@ -21,7 +21,7 @@ use bitcoin::{
     WitnessCommitment,
 };
 
-use crate::script::verify_transaction_scripts;
+use crate::script::{verify_transaction_scripts, verify_transaction_scripts_with_serialized};
 use crate::time;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2034,6 +2034,41 @@ pub(crate) fn validate_transaction_scripts_with_flags(
     previous_outputs: &[bitcoin::TxOut],
     flags: u32,
 ) -> Result<(), ValidationError> {
+    validate_transaction_scripts_inner(transaction, previous_outputs, flags, None)
+}
+
+/// Validate scripts using a transaction serialization that the caller has
+/// already produced. Block connection uses this to share one serialization
+/// between the witness transaction hash and the native Core bridge.
+pub(crate) fn validate_transaction_scripts_with_flags_and_serialized(
+    transaction: &Transaction,
+    previous_outputs: &[bitcoin::TxOut],
+    flags: u32,
+    serialized: &[u8],
+) -> Result<(), ValidationError> {
+    validate_transaction_scripts_inner(transaction, previous_outputs, flags, Some(serialized))
+}
+
+pub(crate) fn script_validation_error(
+    transaction: &Transaction,
+    previous_outputs: &[bitcoin::TxOut],
+    input: usize,
+) -> ValidationError {
+    ValidationError::Script {
+        txid: transaction.compute_txid(),
+        input,
+        reason: script_error_reason_hint(transaction, previous_outputs, input)
+            .map(str::to_owned)
+            .unwrap_or_else(|| "script verification failed".to_owned()),
+    }
+}
+
+fn validate_transaction_scripts_inner(
+    transaction: &Transaction,
+    previous_outputs: &[bitcoin::TxOut],
+    flags: u32,
+    serialized: Option<&[u8]>,
+) -> Result<(), ValidationError> {
     if previous_outputs.len() != transaction.input.len() {
         return Err(ValidationError::Script {
             txid: transaction.compute_txid(),
@@ -2041,14 +2076,23 @@ pub(crate) fn validate_transaction_scripts_with_flags(
             reason: "previous-output count does not match input count".to_owned(),
         });
     }
-    if let Err(input) = verify_transaction_scripts(transaction, previous_outputs, flags) {
-        return Err(ValidationError::Script {
-            txid: transaction.compute_txid(),
+    let verification = serialized.map_or_else(
+        || verify_transaction_scripts(transaction, previous_outputs, flags),
+        |serialized| {
+            verify_transaction_scripts_with_serialized(
+                transaction,
+                previous_outputs,
+                flags,
+                serialized,
+            )
+        },
+    );
+    if let Err(input) = verification {
+        return Err(script_validation_error(
+            transaction,
+            previous_outputs,
             input,
-            reason: script_error_reason_hint(transaction, previous_outputs, input)
-                .map(str::to_owned)
-                .unwrap_or_else(|| "script verification failed".to_owned()),
-        });
+        ));
     }
     Ok(())
 }

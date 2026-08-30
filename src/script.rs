@@ -4,6 +4,8 @@
 //! a few of them are broader than Core's policy `Solver`. RPC output, standard
 //! transaction policy, and BIP37 all expose the narrower Core classification.
 
+use std::ptr::NonNull;
+
 use bitcoin::consensus::encode::serialize;
 use bitcoin::{Script, Transaction, TxOut};
 
@@ -12,6 +14,11 @@ struct NativeUtxo {
     script_pubkey: *const u8,
     script_pubkey_len: u32,
     value: i64,
+}
+
+#[repr(C)]
+struct NativeScriptContext {
+    _private: [u8; 0],
 }
 
 unsafe extern "C" {
@@ -23,6 +30,107 @@ unsafe extern "C" {
         flags: u32,
         failed_input: *mut u32,
     ) -> i32;
+
+    fn bitcoind_rs_create_script_context(
+        transaction_bytes: *const u8,
+        transaction_len: u32,
+        spent_outputs: *const NativeUtxo,
+        spent_outputs_len: u32,
+        flags: u32,
+    ) -> *mut NativeScriptContext;
+
+    fn bitcoind_rs_destroy_script_context(context: *mut NativeScriptContext);
+
+    fn bitcoind_rs_verify_script_context_input(
+        context: *const NativeScriptContext,
+        input: u32,
+        flags: u32,
+    ) -> i32;
+}
+
+/// Parsed Core transaction state shared by independent input checks.
+///
+/// The native object owns its transaction and spent outputs. After creation
+/// both it and `PrecomputedTransactionData` are read-only, while the script
+/// interpreter keeps its execution stack and Taproot execution data local to
+/// each call. That is the same sharing model Core uses for its `CScriptCheck`
+/// queue.
+pub(crate) struct ScriptValidationContext {
+    raw: NonNull<NativeScriptContext>,
+    input_count: usize,
+}
+
+// SAFETY: the native context is immutable after construction. Each verifier
+// call creates its TransactionSignatureChecker and ScriptExecutionData on the
+// calling thread; no mutable native state is shared between calls.
+unsafe impl Send for ScriptValidationContext {}
+unsafe impl Sync for ScriptValidationContext {}
+
+impl ScriptValidationContext {
+    pub(crate) fn new(
+        transaction: &Transaction,
+        previous_outputs: &[TxOut],
+        flags: u32,
+        serialized: &[u8],
+    ) -> Result<Self, usize> {
+        if previous_outputs.len() != transaction.input.len() {
+            return Err(0);
+        }
+        let Ok(transaction_len) = u32::try_from(serialized.len()) else {
+            return Err(0);
+        };
+        let Ok(spent_outputs_len) = u32::try_from(previous_outputs.len()) else {
+            return Err(0);
+        };
+        let native_outputs = previous_outputs
+            .iter()
+            .map(|output| NativeUtxo {
+                script_pubkey: output.script_pubkey.as_bytes().as_ptr(),
+                script_pubkey_len: u32::try_from(output.script_pubkey.len())
+                    .expect("scriptPubKey length fits the native consensus ABI"),
+                value: i64::try_from(output.value.to_sat())
+                    .expect("consensus output value fits the native consensus ABI"),
+            })
+            .collect::<Vec<_>>();
+        let raw = unsafe {
+            bitcoind_rs_create_script_context(
+                serialized.as_ptr(),
+                transaction_len,
+                native_outputs.as_ptr(),
+                spent_outputs_len,
+                flags,
+            )
+        };
+        let Some(raw) = NonNull::new(raw) else {
+            return Err(0);
+        };
+        Ok(Self {
+            raw,
+            input_count: transaction.input.len(),
+        })
+    }
+
+    pub(crate) fn verify_input(&self, input: usize, flags: u32) -> Result<(), usize> {
+        if input >= self.input_count {
+            return Err(input);
+        }
+        let Ok(input) = u32::try_from(input) else {
+            return Err(input);
+        };
+        let result =
+            unsafe { bitcoind_rs_verify_script_context_input(self.raw.as_ptr(), input, flags) };
+        if result == 1 {
+            Ok(())
+        } else {
+            Err(input as usize)
+        }
+    }
+}
+
+impl Drop for ScriptValidationContext {
+    fn drop(&mut self) {
+        unsafe { bitcoind_rs_destroy_script_context(self.raw.as_ptr()) };
+    }
 }
 
 /// Verify all inputs of one transaction through Core's script engine while
@@ -34,10 +142,22 @@ pub(crate) fn verify_transaction_scripts(
     previous_outputs: &[TxOut],
     flags: u32,
 ) -> Result<(), usize> {
+    let serialized = serialize(transaction);
+    verify_transaction_scripts_with_serialized(transaction, previous_outputs, flags, &serialized)
+}
+
+/// Variant used by block validation when the witness serialization was
+/// already produced for the script-cache key. Reusing those bytes avoids a
+/// second full transaction traversal before entering Core's script engine.
+pub(crate) fn verify_transaction_scripts_with_serialized(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    flags: u32,
+    serialized: &[u8],
+) -> Result<(), usize> {
     if previous_outputs.len() != transaction.input.len() {
         return Err(0);
     }
-    let serialized = serialize(transaction);
     let native_outputs = previous_outputs
         .iter()
         .map(|output| NativeUtxo {
@@ -226,9 +346,71 @@ fn decode_minimal_script_number(data: &[u8]) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::ScriptBuf;
+    use std::thread;
 
-    use super::{core_multisig_solution, is_core_multisig, is_core_p2pk};
+    use bitcoin::blockdata::transaction::Version;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+
+    use super::{
+        ScriptValidationContext, core_multisig_solution, is_core_multisig, is_core_p2pk,
+        verify_transaction_scripts_with_serialized,
+    };
+
+    #[test]
+    fn shared_context_checks_inputs_concurrently() {
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint::new(Txid::all_zeros(), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::default(),
+                },
+                TxIn {
+                    previous_output: OutPoint::new(Txid::all_zeros(), 1),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::default(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let previous_outputs = vec![
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        ];
+        let serialized = serialize(&transaction);
+        let context = ScriptValidationContext::new(&transaction, &previous_outputs, 0, &serialized)
+            .expect("valid transaction context");
+        thread::scope(|scope| {
+            let first = scope.spawn(|| context.verify_input(0, 0));
+            let second = scope.spawn(|| context.verify_input(1, 0));
+            assert_eq!(first.join().expect("first script worker"), Ok(()));
+            assert_eq!(second.join().expect("second script worker"), Ok(()));
+        });
+        assert_eq!(
+            verify_transaction_scripts_with_serialized(
+                &transaction,
+                &previous_outputs,
+                0,
+                &serialized,
+            ),
+            Ok(())
+        );
+    }
 
     #[test]
     fn core_p2pk_requires_a_core_key_prefix() {

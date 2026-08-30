@@ -6,13 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static MOCK_TIME: AtomicI64 = AtomicI64::new(0);
 
 #[cfg(test)]
-use std::cell::Cell;
-#[cfg(test)]
 static MOCK_TIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-#[cfg(test)]
-thread_local! {
-    static MOCK_TIME_TEST_GUARD_HELD: Cell<bool> = const { Cell::new(false) };
-}
 
 #[cfg(test)]
 pub(crate) struct MockTimeTestGuard {
@@ -26,9 +20,6 @@ pub(crate) fn mock_time_test_guard() -> MockTimeTestGuard {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = MOCK_TIME.load(Ordering::Relaxed);
-    MOCK_TIME_TEST_GUARD_HELD.with(|held| {
-        debug_assert!(!held.replace(true));
-    });
     MockTimeTestGuard {
         previous,
         _lock: lock,
@@ -39,33 +30,23 @@ pub(crate) fn mock_time_test_guard() -> MockTimeTestGuard {
 impl Drop for MockTimeTestGuard {
     fn drop(&mut self) {
         MOCK_TIME.store(self.previous, Ordering::Relaxed);
-        MOCK_TIME_TEST_GUARD_HELD.with(|held| held.set(false));
     }
 }
 
 /// Set the process clock used by Bitcoin time-sensitive code. A value of zero
 /// restores the system clock, matching Core's `setmocktime` RPC.
 pub fn set_mock_time(seconds: i64) {
-    #[cfg(test)]
-    if !MOCK_TIME_TEST_GUARD_HELD.with(Cell::get) {
-        let _lock = MOCK_TIME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        MOCK_TIME.store(seconds, Ordering::Relaxed);
-        return;
-    }
+    // MOCK_TIME is atomic. Do not acquire MOCK_TIME_TEST_LOCK here: callers
+    // may update mock time from a worker thread while the coordinating test
+    // thread holds its serialization guard.
     MOCK_TIME.store(seconds, Ordering::Relaxed);
 }
 
 /// Return the configured mock timestamp, or zero when the system clock is in use.
 pub fn mock_time() -> i64 {
-    #[cfg(test)]
-    if !MOCK_TIME_TEST_GUARD_HELD.with(Cell::get) {
-        let _lock = MOCK_TIME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        return MOCK_TIME.load(Ordering::Relaxed);
-    }
+    // Readers need no mutex: the value is atomic, and taking the test mutex
+    // here can deadlock a startup worker while a test keeps its guard on the
+    // coordinating thread.
     MOCK_TIME.load(Ordering::Relaxed)
 }
 

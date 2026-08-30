@@ -2165,7 +2165,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "getblockfilter" => Some(&["blockhash", "filtertype"]),
         "getblockstats" => Some(&["hash_or_height", "stats"]),
         "getblockfileinfo" => Some(&["file_number"]),
-        "getcompressioninfo" => Some(&[]),
+        "getcompressioninfo" | "compactutxo" => Some(&[]),
         "getblocklocations" => Some(&["blockhash", "nblocks"]),
         "getchaintxstats" => Some(&["nblocks", "blockhash"]),
         "getnetworkhashps" => Some(&["nblocks", "height"]),
@@ -2373,6 +2373,7 @@ fn rpc_argument_aliases(method: &str, index: usize, name: &str) -> &'static [&'s
 
 fn rpc_command_conversions() -> Value {
     const HIDDEN_METHODS: &[&str] = &[
+        "compactutxo",
         "addconnection",
         "addpeeraddress",
         "echo",
@@ -2751,6 +2752,13 @@ fn dispatch_method_for_user(
         "gettxoutsetinfo" => get_txout_set_info(node, params),
         "dumptxoutset" => dump_txoutset(node, params),
         "loadtxoutset" => load_txoutset(node, params),
+        "compactutxo" => {
+            let mut chain = node.chain.write();
+            chain.compact_utxo()?;
+            Ok(json!({
+                "disk_size": chain.utxo_disk_size()?,
+            }))
+        }
         "pruneblockchain" => prune_blockchain(node, params),
         "getblockfileinfo" => get_block_file_info(node, params),
         "getcompressioninfo" => get_compression_info(node),
@@ -2868,7 +2876,8 @@ fn dispatch_method_for_user(
                         "lastrecv": peer.last_recv,
                         "last_transaction": peer.last_transaction,
                         "last_block": peer.last_block,
-                        "last_block_announcement": peer.last_block_announcement,
+                        "last_inv_sequence": peer.last_inv_sequence,
+                        "inv_to_send": peer.inv_to_send,
                         "bytessent": peer.bytes_sent,
                         "bytesrecv": peer.bytes_received,
                         "conntime": peer.connected_at,
@@ -2886,8 +2895,6 @@ fn dispatch_method_for_user(
                         "addr_processed": peer.addr_processed,
                         "addr_rate_limited": peer.addr_rate_limited,
                         "permissions": peer.permissions.to_strings(),
-                        "forced_inbound": peer.forced_inbound,
-                        "misbehavior_score": 0,
                         "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                         "bytessent_per_msg": peer.bytes_sent_per_msg,
                         "bytesrecv_per_msg": peer.bytes_received_per_msg,
@@ -12580,7 +12587,7 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 } else {
                     "prev-blk-not-found"
                 }))
-            } else if let Some(reason) = bip22_validation_result(&error) {
+            } else if let Some(reason) = submitblock_validation_result(&error) {
                 // Core records a header as failed-validation when a known
                 // header is later rejected with a block body, but a bad
                 // merkle root or witness commitment can be a mismatched body
@@ -12734,6 +12741,23 @@ fn bip22_validation_result(error: &anyhow::Error) -> Option<Value> {
     error
         .downcast_ref::<validation::ValidationError>()
         .map(|error| json!(error.bip22_reject_reason()))
+}
+
+fn submitblock_validation_result(error: &anyhow::Error) -> Option<Value> {
+    error
+        .downcast_ref::<validation::ValidationError>()
+        .map(|error| {
+            let reason = error.bip22_reject_reason();
+            let reason = if let Some(suffix) = reason
+                .strip_prefix("mandatory-script-verify-flag-failed")
+                .map(str::to_owned)
+            {
+                format!("block-script-verify-flag-failed{suffix}")
+            } else {
+                reason
+            };
+            json!(reason)
+        })
 }
 
 fn generate_to_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -13248,9 +13272,8 @@ fn mining_block_with_deployment_parameters(
     let segwit_active = height >= deployment_parameters.buried.segwit;
     let mut coinbase = Transaction {
         // Core's CMutableTransaction defaults are version 2, locktime zero,
-        // and a final input sequence. Keep generated blocks byte-compatible
-        // with Core: these fields are part of the coinbase txid and therefore
-        // affect deterministic chain/test vectors.
+        // and a final input sequence. Coinbase transactions do not use the
+        // anti-fee-sniping locktime applied to ordinary transactions.
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
@@ -15404,14 +15427,6 @@ fn submit_package_failure_message_with_context(
     if matches!(error, MempoolError::Truc(_)) {
         return error.to_string();
     }
-    if package_rbf {
-        if matches!(error, MempoolError::TooManyReplacementCandidates { .. }) {
-            return format!("package RBF failed: {error}");
-        }
-        if matches!(error, MempoolError::PackageRbfConflictTopology(_)) {
-            return error.to_string();
-        }
-    }
     if matches!(
         error,
         MempoolError::NonStandard(reason) if reason == "unspent-dust"
@@ -17529,6 +17544,7 @@ fn rpc_help(method: &str) -> String {
         ("Zmq", &["getzmqnotifications"]),
     ];
     const HIDDEN_METHODS: &[&str] = &[
+        "compactutxo",
         "addconnection",
         "addpeeraddress",
         "echo",
@@ -25200,14 +25216,8 @@ mod tests {
         .unwrap();
         let unversioned_peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(unversioned_peer_info[0]["relaytxes"], json!(false));
-        assert_eq!(
-            unversioned_peer_info[0]["last_block_announcement"],
-            json!(0)
-        );
-        assert_eq!(unversioned_peer_info[0]["forced_inbound"], json!(false));
-        assert_eq!(unversioned_peer_info[0]["misbehavior_score"], json!(0));
-        assert!(unversioned_peer_info[0].get("last_inv_sequence").is_none());
-        assert!(unversioned_peer_info[0].get("inv_to_send").is_none());
+        assert_eq!(unversioned_peer_info[0]["last_inv_sequence"], json!(0));
+        assert_eq!(unversioned_peer_info[0]["inv_to_send"], json!(0));
         assert_eq!(
             unversioned_peer_info[0]["permissions"],
             json!(["forcerelay", "relay"])
@@ -29564,6 +29574,12 @@ mod tests {
 
     #[test]
     fn submit_package_requires_topologically_sorted_parent_and_child() {
+        // The regtest clock is process-wide, and another RPC test temporarily
+        // advances it while checking time-sensitive chainstate fields. Keep
+        // this mining/validation test out of that window so generated blocks
+        // cannot be rejected as being more than two hours in the future.
+        let _mock_time_guard = crate::time::mock_time_test_guard();
+        crate::time::set_mock_time(0);
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             network: Network::Regtest,

@@ -155,11 +155,20 @@ const HEADER_JOURNAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 // low-transaction early chain so crash recovery remains bounded without
 // turning every few thousand IBD blocks into a stop-the-world NFS sync.
 const PEER_STORAGE_FLUSH_BLOCKS: u32 = 65_536;
-// Native persistence writes the compressed body, undo, chainstate delta,
-// UTXO/index keys, and optional Electrum history events. Reserve a generous
-// multiple of incoming body bytes so an LSM journal or compaction cannot
-// consume Core's 50 MiB emergency floor mid-batch.
+// Before opening a new unsynced peer-storage batch, reserve a generous
+// multiple of its bounded initial write window so append-only records and LSM
+// journals cannot consume Core's 50 MiB emergency floor immediately.
 const NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER: u64 = 10;
+// A durability flush does not rewrite the block bodies accumulated since the
+// previous checkpoint: their compressed records, undo records, and
+// chainstate deltas have already been appended in bounded buffers. The dirty
+// UTXO overlay is the part that can still expand materially while Fjall writes
+// its journal, tables, and a possible compaction output. Its in-memory byte
+// accounting is already conservative, so four times that value provides
+// ample transient headroom without making a large dbcache require ten copies
+// of every historical block byte in the batch.
+const NATIVE_UTXO_FLUSH_RESERVE_MULTIPLIER: u64 = 4;
+const NATIVE_STORAGE_MIN_FLUSH_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const IBD_BENCH_BLOCKS: u32 = 256;
 // Headers-first IBD normally drains long contiguous runs of already-stored
 // bodies after one missing parent arrives. Fetching prevouts one block at a
@@ -215,6 +224,13 @@ struct ConnectTimings {
     history_index: Duration,
     finalization: Duration,
     total: Duration,
+}
+
+fn pending_flush_disk_reserve(pending_utxo_bytes: usize) -> u64 {
+    u64::try_from(pending_utxo_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(NATIVE_UTXO_FLUSH_RESERVE_MULTIPLIER)
+        .max(NATIVE_STORAGE_MIN_FLUSH_RESERVE_BYTES)
 }
 
 fn connect_benchmark_window(label: &str, blocks: u32, height: u32) -> String {
@@ -3236,9 +3252,8 @@ impl ChainState {
     }
 
     fn ensure_disk_space_for_pending_flush(&self) -> Result<()> {
-        let additional = self
-            .peer_storage_bytes_since_flush
-            .saturating_mul(NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER);
+        let (_, pending_utxo_bytes, _, _) = self.utxo_store.pending_stats();
+        let additional = pending_flush_disk_reserve(pending_utxo_bytes);
         self.ensure_disk_space_for_paths(additional)
     }
 
@@ -16854,6 +16869,35 @@ mod tests {
         assert_eq!(reopened.height(), 70);
         assert_eq!(reopened.best_hash(), tip);
         assert_eq!(reopened.block_hash(70), Some(tip));
+    }
+
+    #[test]
+    fn pending_flush_reserve_tracks_dirty_utxos_not_accumulated_block_bytes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            pending_flush_disk_reserve(0),
+            NATIVE_STORAGE_MIN_FLUSH_RESERVE_BYTES
+        );
+
+        if usize::BITS >= 64 {
+            let pending_32_gib = usize::try_from(32 * GIB).unwrap();
+            let reserve_32_gib = pending_flush_disk_reserve(pending_32_gib);
+            assert_eq!(reserve_32_gib, 128 * GIB);
+
+            // This reproduces the failed 32 GiB-cache IBD preflight: about
+            // 93 GiB of raw block bodies had already been appended, and the
+            // old calculation demanded another 932 GiB before allowing the
+            // UTXO checkpoint. The reserve now depends only on data that the
+            // flush can still write, so historical body volume cannot inflate
+            // it.
+            let accumulated_raw_block_bytes = 100_123_599_789u64;
+            assert!(
+                reserve_32_gib
+                    < accumulated_raw_block_bytes
+                        .saturating_mul(NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER)
+            );
+        }
     }
 
     #[test]

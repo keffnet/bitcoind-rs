@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -59,6 +59,48 @@ use crate::{
     OutboundEvictionAction, PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions, StartupLatch,
     unix_time_seconds,
 };
+
+type PreparedPeerBlock = (
+    Arc<Block>,
+    crate::storage::PreparedBlockRecord,
+    Duration,
+    Duration,
+);
+
+/// Keep CPU-heavy block serialization and zstd compression away from
+/// Tokio's shared blocking pool. Chain mutation still uses `spawn_blocking`,
+/// but a burst of received bodies can no longer queue those latency-sensitive
+/// jobs behind dozens of compression tasks.
+fn peer_block_preparation_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        let workers = cores.div_ceil(2).clamp(1, 8);
+        info!(workers, "Initialized peer block preparation pool");
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("block-prepare-{index}"))
+            .build()
+            .expect("building bounded peer block preparation pool")
+    })
+}
+
+async fn prepare_peer_block(block: Block) -> Result<PreparedPeerBlock> {
+    let submitted = Instant::now();
+    let block = Arc::new(block);
+    let (sender, receiver) = oneshot::channel();
+    peer_block_preparation_pool().spawn(move || {
+        let started = Instant::now();
+        let queue_wait = started.duration_since(submitted);
+        let prepared = crate::storage::BlockStore::prepare_record(&block);
+        let work = started.elapsed();
+        let _ = sender.send((block, prepared, queue_wait, work));
+    });
+    let (block, prepared, queue_wait, work) = receiver
+        .await
+        .context("peer block preparation pool stopped")?;
+    Ok((block, prepared?, queue_wait, work))
+}
 
 macro_rules! peer_log {
     ($node:expr, $level:ident, $endpoint:expr, $message:literal) => {
@@ -8241,12 +8283,8 @@ async fn handle_received_block(
     // cores contribute without allowing competing chain writers to form a
     // lock convoy or deadlock with short peer/RPC chain readers.
     let preparation_started = Instant::now();
-    let (block, prepared) = tokio::task::spawn_blocking(move || {
-        let prepared = crate::storage::BlockStore::prepare_record(&block)?;
-        Ok::<_, anyhow::Error>((block, prepared))
-    })
-    .await
-    .context("peer block preparation task failed")??;
+    let (block, prepared, preparation_queue_elapsed, preparation_work_elapsed) =
+        prepare_peer_block(block).await?;
     let preparation_elapsed = preparation_started.elapsed();
     let block_height = node
         .chain
@@ -8254,8 +8292,9 @@ async fn handle_received_block(
         .block_height_by_hash(&hash)
         .unwrap_or(u32::MAX);
     let queue_wait_started = Instant::now();
-    let _peer_block_processing = node.peer_block_processing.acquire(block_height).await;
+    let peer_block_processing = node.peer_block_processing.acquire(block_height).await;
     let queue_wait_elapsed = queue_wait_started.elapsed();
+    let gate_waiters = node.peer_block_processing.waiter_count();
     if queue_wait_elapsed >= Duration::from_secs(1) {
         let active_tip_height = node.chain.try_read().map(|chain| chain.height());
         info!(
@@ -8270,15 +8309,28 @@ async fn handle_received_block(
         );
     }
     let validation_node = Arc::clone(node);
+    let chain_task_started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         if disconnect_on_invalid {
             validation_node.connect_prepared_block_from_peer(block, prepared)
         } else {
-            validation_node.connect_block(block)
+            validation_node.connect_shared_block(block)
         }
     })
     .await
     .context("peer block validation task failed")?;
+    let chain_task_elapsed = chain_task_started.elapsed();
+    // The gate protects only chain mutation. Peer bookkeeping and logging do
+    // not need to delay admission of the next already-prepared body.
+    drop(peer_block_processing);
+    node.record_ibd_peer_pipeline(
+        preparation_queue_elapsed,
+        preparation_work_elapsed,
+        queue_wait_elapsed,
+        chain_task_elapsed,
+        received_at.elapsed(),
+        gate_waiters,
+    );
     match result {
         Ok(tip) => {
             let (active, block_height) = {

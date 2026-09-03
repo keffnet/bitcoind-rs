@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions, create_dir_all, remove_file};
-use std::io::{BufReader, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, OnceLock,
@@ -16,6 +16,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -63,7 +65,9 @@ pub const STORAGE_COMPRESSION_LEVEL: i32 = 6;
 const STORAGE_COMPRESSION_MIN_SIZE: usize = 256;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
-const APPEND_BUFFER_FLUSH_BYTES: usize = 4 * 1024 * 1024;
+const APPEND_BUFFER_FLUSH_BYTES: usize = 16 * 1024 * 1024;
+const BLOCK_PREALLOCATION_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const UNDO_PREALLOCATION_CHUNK_BYTES: u64 = 1024 * 1024;
 // Core's BufferedFile keeps roughly two maximum block payloads available
 // while reindexing. Use the same order of magnitude for the native store so
 // sequential replay benefits from filesystem/NFS readahead.
@@ -73,6 +77,65 @@ const BLOCK_REPLAY_READ_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 struct Record {
     offset: u64,
     length: u32,
+}
+
+fn preallocate_keep_size(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let offset = i64::try_from(offset)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "file offset exceeds i64"))?;
+        let length = i64::try_from(length)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "file length exceeds i64"))?;
+        // SAFETY: the descriptor remains owned by `file` for the duration of
+        // the call, and fallocate does not access Rust memory.
+        let result =
+            unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, offset, length) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, offset, length);
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "keep-size preallocation is unavailable",
+        ))
+    }
+}
+
+fn ensure_file_preallocated(
+    file: &File,
+    preallocated_through: &mut u64,
+    enabled: &mut bool,
+    end: u64,
+    chunk_bytes: u64,
+    path: &Path,
+) {
+    if !*enabled || end <= *preallocated_through {
+        return;
+    }
+    let target = end.div_ceil(chunk_bytes).saturating_mul(chunk_bytes);
+    let length = target.saturating_sub(*preallocated_through);
+    if length == 0 {
+        return;
+    }
+    match preallocate_keep_size(file, *preallocated_through, length) {
+        Ok(()) => *preallocated_through = target,
+        Err(error) => {
+            // Preallocation is an optimization and is not supported by every
+            // NFS server or filesystem. Disable it for this open descriptor;
+            // the normal append still reports real write/space failures.
+            *enabled = false;
+            tracing::debug!(
+                path = %path.display(),
+                %error,
+                "append-file preallocation is unavailable"
+            );
+        }
+    }
 }
 
 /// Exact compression accounting for one native append-only record file.
@@ -1006,7 +1069,7 @@ fn init_xor_key(directory: &Path, use_xor: bool) -> Result<XorKey> {
 pub struct BlockStoreReader {
     file: Arc<RwLock<File>>,
     index: Arc<RwLock<HashMap<BlockHash, Record>>>,
-    pending_blocks: Arc<RwLock<HashMap<BlockHash, Block>>>,
+    pending_blocks: Arc<RwLock<HashMap<BlockHash, Arc<Block>>>>,
     xor_key: XorKey,
 }
 
@@ -1020,8 +1083,8 @@ impl BlockStoreReader {
         }
     }
 
-    pub fn get(&self, hash: &BlockHash) -> Result<Option<Block>> {
-        if let Some(block) = self.pending_blocks.read().get(hash).cloned() {
+    pub(crate) fn get_shared(&self, hash: &BlockHash) -> Result<Option<Arc<Block>>> {
+        if let Some(block) = self.pending_blocks.read().get(hash).map(Arc::clone) {
             return Ok(Some(block));
         }
         let Some(record) = self.index.read().get(hash).copied() else {
@@ -1034,7 +1097,12 @@ impl BlockStoreReader {
         if block.block_hash() != *hash {
             bail!("stored block hash does not match block index");
         }
-        Ok(Some(block))
+        Ok(Some(Arc::new(block)))
+    }
+
+    pub fn get(&self, hash: &BlockHash) -> Result<Option<Block>> {
+        self.get_shared(hash)
+            .map(|block| block.map(|block| block.as_ref().clone()))
     }
 
     pub fn transaction_count(&self, hash: &BlockHash) -> Result<Option<usize>> {
@@ -1051,7 +1119,7 @@ impl BlockStoreReader {
         self.index.write().insert(hash, record);
     }
 
-    fn insert_pending(&self, hash: BlockHash, block: Block) {
+    fn insert_pending(&self, hash: BlockHash, block: Arc<Block>) {
         self.pending_blocks.write().insert(hash, block);
     }
 
@@ -1084,6 +1152,10 @@ pub struct BlockStore {
     undo_index: HashMap<BlockHash, Record>,
     block_data_len: u64,
     undo_data_len: u64,
+    block_preallocated_through: u64,
+    undo_preallocated_through: u64,
+    block_preallocation_enabled: bool,
+    undo_preallocation_enabled: bool,
     pending_block_data: Vec<u8>,
     pending_index_data: Vec<u8>,
     pending_undo_data: Vec<u8>,
@@ -1091,12 +1163,23 @@ pub struct BlockStore {
     xor_key: XorKey,
     block_file_read_only: bool,
     allow_block_file_reopen: bool,
-    block_cache: HashMap<BlockHash, (Block, usize)>,
+    block_cache: HashMap<BlockHash, (Arc<Block>, usize)>,
     block_cache_order: VecDeque<BlockHash>,
     block_cache_bytes: usize,
     block_cache_limit: usize,
+    block_cache_metrics: BlockStoreCacheMetrics,
     block_compression_cache: Arc<Mutex<StorageCompressionCache>>,
     undo_compression_cache: Arc<Mutex<StorageCompressionCache>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BlockStoreCacheMetrics {
+    pub(crate) lookups: u64,
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) lookup_time: Duration,
+    pub(crate) load_time: Duration,
+    pub(crate) decode_time: Duration,
 }
 
 struct StorageCompressionSnapshot {
@@ -1377,6 +1460,10 @@ impl BlockStore {
             undo_index,
             block_data_len: data_len,
             undo_data_len,
+            block_preallocated_through: data_len,
+            undo_preallocated_through: undo_data_len,
+            block_preallocation_enabled: !block_file_read_only,
+            undo_preallocation_enabled: true,
             pending_block_data: Vec::new(),
             pending_index_data: Vec::new(),
             pending_undo_data: Vec::new(),
@@ -1388,6 +1475,7 @@ impl BlockStore {
             block_cache_order: VecDeque::new(),
             block_cache_bytes: 0,
             block_cache_limit: 0,
+            block_cache_metrics: BlockStoreCacheMetrics::default(),
             block_compression_cache,
             undo_compression_cache,
         })
@@ -1463,6 +1551,10 @@ impl BlockStore {
             undo_index,
             block_data_len: data_len,
             undo_data_len,
+            block_preallocated_through: data_len,
+            undo_preallocated_through: undo_data_len,
+            block_preallocation_enabled: false,
+            undo_preallocation_enabled: false,
             pending_block_data: Vec::new(),
             pending_index_data: Vec::new(),
             pending_undo_data: Vec::new(),
@@ -1474,6 +1566,7 @@ impl BlockStore {
             block_cache_order: VecDeque::new(),
             block_cache_bytes: 0,
             block_cache_limit: 0,
+            block_cache_metrics: BlockStoreCacheMetrics::default(),
             block_compression_cache,
             undo_compression_cache,
         })
@@ -1494,17 +1587,6 @@ impl BlockStore {
         self.trim_block_cache();
     }
 
-    fn touch_block_cache(&mut self, hash: BlockHash) {
-        if let Some(position) = self
-            .block_cache_order
-            .iter()
-            .position(|cached| *cached == hash)
-        {
-            self.block_cache_order.remove(position);
-        }
-        self.block_cache_order.push_back(hash);
-    }
-
     fn trim_block_cache(&mut self) {
         while self.block_cache_bytes > self.block_cache_limit {
             let Some(hash) = self.block_cache_order.pop_front() else {
@@ -1517,13 +1599,19 @@ impl BlockStore {
         }
     }
 
-    fn cache_block(&mut self, hash: BlockHash, block: Block, bytes: usize) {
+    fn cache_block(&mut self, hash: BlockHash, block: Arc<Block>, bytes: usize) {
         if self.block_cache_limit == 0 || bytes > self.block_cache_limit {
             return;
         }
-        if let Some((_, old_bytes)) = self.block_cache.remove(&hash) {
-            self.block_cache_bytes = self.block_cache_bytes.saturating_sub(old_bytes);
-            self.block_cache_order.retain(|cached| *cached != hash);
+        if let Some((cached, old_bytes)) = self.block_cache.get_mut(&hash) {
+            self.block_cache_bytes = self
+                .block_cache_bytes
+                .saturating_sub(*old_bytes)
+                .saturating_add(bytes);
+            *cached = block;
+            *old_bytes = bytes;
+            self.trim_block_cache();
+            return;
         }
         self.block_cache_bytes = self.block_cache_bytes.saturating_add(bytes);
         self.block_cache.insert(hash, (block, bytes));
@@ -1790,6 +1878,8 @@ impl BlockStore {
                 format!("reopening block store {} for writing", self.path.display())
             })?;
         self.block_data_len = self.file.metadata()?.len();
+        self.block_preallocated_through = self.block_data_len;
+        self.block_preallocation_enabled = true;
         self.serving_reader
             .replace(self.file.try_clone()?, self.index.clone());
         self.block_file_read_only = false;
@@ -1802,7 +1892,7 @@ impl BlockStore {
             return Ok(hash);
         }
         let prepared = Self::prepare_record(block)?;
-        self.insert_prepared_with_sync(block, prepared, sync)
+        self.insert_prepared_with_sync(block, prepared, sync, None)
     }
 
     pub(crate) fn prepare_record(block: &Block) -> Result<PreparedBlockRecord> {
@@ -1821,7 +1911,7 @@ impl BlockStore {
         block: &Block,
         prepared: PreparedBlockRecord,
     ) -> Result<BlockHash> {
-        self.insert_prepared_with_sync(block, prepared, true)
+        self.insert_prepared_with_sync(block, prepared, true, None)
     }
 
     pub(crate) fn insert_prepared_unsynced(
@@ -1829,7 +1919,15 @@ impl BlockStore {
         block: &Block,
         prepared: PreparedBlockRecord,
     ) -> Result<BlockHash> {
-        self.insert_prepared_with_sync(block, prepared, false)
+        self.insert_prepared_with_sync(block, prepared, false, None)
+    }
+
+    pub(crate) fn insert_prepared_unsynced_shared(
+        &mut self,
+        block: Arc<Block>,
+        prepared: PreparedBlockRecord,
+    ) -> Result<BlockHash> {
+        self.insert_prepared_with_sync(&block, prepared, false, Some(Arc::clone(&block)))
     }
 
     /// Retain a bounded decoded copy of a peer body that was stored while its
@@ -1838,9 +1936,9 @@ impl BlockStore {
     /// activating that suffix decodes every body from the NFS-backed append
     /// file a second time. The normal block cache already has the Core-sized
     /// `dbcache / 8` budget, so this does not create a second unbounded body
-    /// store and older entries are evicted by the existing LRU policy.
-    pub(crate) fn cache_peer_block(&mut self, block: &Block) {
-        self.cache_block(block.block_hash(), block.clone(), block.total_size());
+    /// store and older entries are evicted by the existing FIFO policy.
+    pub(crate) fn cache_peer_block(&mut self, block: Arc<Block>) {
+        self.cache_block(block.block_hash(), Arc::clone(&block), block.total_size());
     }
 
     fn insert_prepared_with_sync(
@@ -1848,6 +1946,7 @@ impl BlockStore {
         block: &Block,
         prepared: PreparedBlockRecord,
         sync: bool,
+        shared_block: Option<Arc<Block>>,
     ) -> Result<BlockHash> {
         let hash = block.block_hash();
         if self.index.contains_key(&hash) {
@@ -1868,6 +1967,14 @@ impl BlockStore {
         record.extend_from_slice(&bytes);
         self.xor_key.apply(&mut record, offset);
         let record_len = u64::try_from(record.len()).context("block record length overflowed")?;
+        ensure_file_preallocated(
+            &self.file,
+            &mut self.block_preallocated_through,
+            &mut self.block_preallocation_enabled,
+            offset.saturating_add(record_len),
+            BLOCK_PREALLOCATION_CHUNK_BYTES,
+            &self.path,
+        );
         if sync {
             self.file.write_all(&record)?;
             self.file.sync_data()?;
@@ -1896,18 +2003,23 @@ impl BlockStore {
         self.index.insert(hash, Record { offset, length });
         self.serving_reader.insert(hash, Record { offset, length });
         if !sync && !self.pending_block_data.is_empty() {
-            self.serving_reader.insert_pending(hash, block.clone());
+            let pending = shared_block
+                .as_ref()
+                .map(Arc::clone)
+                .unwrap_or_else(|| Arc::new(block.clone()));
+            self.serving_reader.insert_pending(hash, pending);
         }
         // Core does not retain a second decoded copy of every block while
         // importing the chain.  The peer task already owns the parsed block,
         // the serving reader keeps the short append-buffer suffix available
         // to uploaders, and the durable file is the source for later reads.
-        // Populating the LRU here would clone the complete block once per
+        // Populating the decoded cache here would clone the complete block once per
         // IBD block and spend the block-cache budget on data that is almost
         // never read again before it is evicted.  Keep the cache for
         // synchronous inserts, where callers may immediately query the block.
         if sync {
-            self.cache_block(hash, block.clone(), prepared.raw_length);
+            let cached = shared_block.unwrap_or_else(|| Arc::new(block.clone()));
+            self.cache_block(hash, cached, prepared.raw_length);
         }
         note_compressed_record_append(
             &self.block_compression_cache,
@@ -1929,15 +2041,25 @@ impl BlockStore {
         Ok(())
     }
 
-    pub fn get(&mut self, hash: &BlockHash) -> Result<Option<Block>> {
-        if let Some(block) = self.block_cache.get(hash).map(|(block, _)| block.clone()) {
-            self.touch_block_cache(*hash);
+    pub(crate) fn get_shared(&mut self, hash: &BlockHash) -> Result<Option<Arc<Block>>> {
+        let lookup_started = Instant::now();
+        self.block_cache_metrics.lookups = self.block_cache_metrics.lookups.saturating_add(1);
+        if let Some(block) = self
+            .block_cache
+            .get(hash)
+            .map(|(block, _)| Arc::clone(block))
+        {
+            self.block_cache_metrics.hits = self.block_cache_metrics.hits.saturating_add(1);
+            self.block_cache_metrics.lookup_time += lookup_started.elapsed();
             return Ok(Some(block));
         }
+        self.block_cache_metrics.misses = self.block_cache_metrics.misses.saturating_add(1);
         let Some(record) = self.index.get(hash).copied() else {
+            self.block_cache_metrics.lookup_time += lookup_started.elapsed();
             return Ok(None);
         };
         self.flush_pending_io()?;
+        let load_started = Instant::now();
         let bytes = read_storage_record(
             &self.file,
             record,
@@ -1945,17 +2067,35 @@ impl BlockStore {
             MAX_STORED_BLOCK_SIZE,
             "block",
         )?;
+        self.block_cache_metrics.load_time += load_started.elapsed();
+        let decode_started = Instant::now();
         let block: Block = deserialize(&bytes).context("decoding stored block")?;
+        self.block_cache_metrics.decode_time += decode_started.elapsed();
         if block.block_hash() != *hash {
             bail!("stored block hash does not match block index");
         }
-        self.cache_block(*hash, block.clone(), bytes.len());
+        let block = Arc::new(block);
+        self.cache_block(*hash, Arc::clone(&block), bytes.len());
+        self.block_cache_metrics.lookup_time += lookup_started.elapsed();
         Ok(Some(block))
+    }
+
+    pub fn get(&mut self, hash: &BlockHash) -> Result<Option<Block>> {
+        self.get_shared(hash)
+            .map(|block| block.map(|block| block.as_ref().clone()))
+    }
+
+    pub(crate) fn take_cache_metrics(&mut self) -> (BlockStoreCacheMetrics, usize, usize) {
+        (
+            std::mem::take(&mut self.block_cache_metrics),
+            self.block_cache.len(),
+            self.block_cache_bytes,
+        )
     }
 
     /// Read one block during a forward chainstate replay.
     ///
-    /// Unlike [`Self::get`], this deliberately bypasses the decoded block LRU
+    /// Unlike [`Self::get`], this deliberately bypasses the decoded block cache
     /// and uses a buffered sequential cursor. Replay callers walk a known
     /// active-chain path, so keeping the file cursor aligned with the next
     /// record lets the kernel/NFS client perform useful readahead instead of
@@ -2002,7 +2142,7 @@ impl BlockStore {
         read_block_transaction_count(&self.file, record, self.xor_key).map(Some)
     }
 
-    /// Read a block without touching the mutable LRU cache or the seek
+    /// Read a block without touching the mutable decoded cache or the seek
     /// cursor owned by the normal chain-state path. Peer uploads can use this
     /// method while holding only a shared ChainState lock, so serving an old
     /// branch cannot delay validation of a competing active candidate.
@@ -2069,6 +2209,19 @@ impl BlockStore {
         record.extend_from_slice(&bytes);
         self.xor_key.apply(&mut record, offset);
         let record_len = u64::try_from(record.len()).context("undo record length overflowed")?;
+        let undo_path = self
+            .path
+            .parent()
+            .expect("block store path has a parent")
+            .join("undo.dat");
+        ensure_file_preallocated(
+            &self.undo_file,
+            &mut self.undo_preallocated_through,
+            &mut self.undo_preallocation_enabled,
+            offset.saturating_add(record_len),
+            UNDO_PREALLOCATION_CHUNK_BYTES,
+            &undo_path,
+        );
         if sync {
             self.undo_file.write_all(&record)?;
             self.undo_file.sync_data()?;
@@ -2187,6 +2340,8 @@ impl BlockStore {
         self.file = file;
         self.reset_replay_reader();
         self.block_data_len = data_len;
+        self.block_preallocated_through = data_len;
+        self.block_preallocation_enabled = true;
         self.pending_block_data.clear();
         self.pending_index_data.clear();
         self.index = index;
@@ -2219,6 +2374,8 @@ impl BlockStore {
         )?;
         self.undo_file = undo_file;
         self.undo_data_len = undo_data_len;
+        self.undo_preallocated_through = undo_data_len;
+        self.undo_preallocation_enabled = true;
         self.pending_undo_data.clear();
         self.pending_undo_index_data.clear();
         self.undo_index = undo_index;
@@ -3837,6 +3994,8 @@ struct UtxoReadTunerState {
     profile: UtxoReadProfile,
     samples: u32,
     lookup_rate_ewma: Option<f64>,
+    candidate_profile: Option<UtxoReadProfile>,
+    candidate_samples: u32,
 }
 
 impl Default for UtxoReadTunerState {
@@ -3846,6 +4005,8 @@ impl Default for UtxoReadTunerState {
             profile: UtxoReadProfile::Latency,
             samples: 0,
             lookup_rate_ewma: None,
+            candidate_profile: None,
+            candidate_samples: 0,
         }
     }
 }
@@ -3859,9 +4020,19 @@ impl UtxoReadTuner {
     fn configure(&self, enabled: bool) {
         let mut state = self.state.lock();
         state.enabled = enabled;
-        state.profile = UtxoReadProfile::Latency;
+        // Start with the least read amplification. Fast local storage stays
+        // here, while sustained low lookup throughput promotes concurrency
+        // through balanced to latency mode. This avoids issuing 64-way
+        // speculative reads before there is evidence the backend needs them.
+        state.profile = if enabled {
+            UtxoReadProfile::LowOverhead
+        } else {
+            UtxoReadProfile::Latency
+        };
         state.samples = 0;
         state.lookup_rate_ewma = None;
+        state.candidate_profile = None;
+        state.candidate_samples = 0;
     }
 
     fn tuning(&self) -> UtxoPrefetchTuning {
@@ -3917,20 +4088,34 @@ impl UtxoReadTuner {
             UtxoReadProfile::LowOverhead if smoothed < 200_000.0 => UtxoReadProfile::Balanced,
             profile => profile,
         };
-        if next != state.profile {
-            let previous = state.profile;
-            state.profile = next;
-            let tuning = Self::profile_tuning(next, true);
-            tracing::info!(
-                previous = previous.name(),
-                profile = next.name(),
-                lookup_rate = smoothed,
-                max_blocks = tuning.max_blocks,
-                max_outpoints = tuning.max_outpoints,
-                read_workers = tuning.read_workers,
-                "Adaptive UTXO prefetch profile changed"
-            );
+        if next == state.profile {
+            state.candidate_profile = None;
+            state.candidate_samples = 0;
+            return;
         }
+        if state.candidate_profile == Some(next) {
+            state.candidate_samples = state.candidate_samples.saturating_add(1);
+        } else {
+            state.candidate_profile = Some(next);
+            state.candidate_samples = 1;
+        }
+        if state.candidate_samples < ADAPTIVE_UTXO_MIN_SAMPLES {
+            return;
+        }
+        let previous = state.profile;
+        state.profile = next;
+        state.candidate_profile = None;
+        state.candidate_samples = 0;
+        let tuning = Self::profile_tuning(next, true);
+        tracing::info!(
+            previous = previous.name(),
+            profile = next.name(),
+            lookup_rate = smoothed,
+            max_blocks = tuning.max_blocks,
+            max_outpoints = tuning.max_outpoints,
+            read_workers = tuning.read_workers,
+            "Adaptive UTXO prefetch profile changed"
+        );
     }
 }
 
@@ -7819,28 +8004,28 @@ mod tests {
         tuner.configure(true);
         let initial = tuner.tuning();
         assert!(initial.adaptive);
-        assert_eq!(initial.profile, "latency");
+        assert_eq!(initial.profile, "low-overhead");
 
-        // One fast sample is not enough to reconfigure a running IBD.
-        tuner.record(1_000_000, Duration::from_secs(1));
-        assert_eq!(tuner.tuning().profile, "latency");
-        for _ in 1..ADAPTIVE_UTXO_MIN_SAMPLES {
-            tuner.record(1_000_000, Duration::from_secs(1));
-        }
-        let low_overhead = tuner.tuning();
-        assert_eq!(low_overhead.profile, "low-overhead");
-        assert!(low_overhead.max_blocks < initial.max_blocks);
-        assert!(low_overhead.max_outpoints < initial.max_outpoints);
-        assert!(low_overhead.read_workers < initial.read_workers);
-
-        // Sustained slow samples eventually demote through the hysteresis
-        // band, while one checkpoint-sized disturbance cannot do so.
+        // One slow sample is not enough to increase read concurrency.
         tuner.record(20_000, Duration::from_secs(1));
         assert_eq!(tuner.tuning().profile, "low-overhead");
-        for _ in 0..16 {
+        for _ in 1..16 {
             tuner.record(20_000, Duration::from_secs(1));
         }
+        let latency = tuner.tuning();
+        assert_eq!(latency.profile, "latency");
+        assert!(latency.max_blocks > initial.max_blocks);
+        assert!(latency.max_outpoints > initial.max_outpoints);
+        assert!(latency.read_workers > initial.read_workers);
+
+        // Sustained high throughput eventually returns to the lower-overhead
+        // profile; hysteresis prevents one hot-cache sample from doing so.
+        tuner.record(1_000_000, Duration::from_secs(1));
         assert_eq!(tuner.tuning().profile, "latency");
+        for _ in 0..16 {
+            tuner.record(1_000_000, Duration::from_secs(1));
+        }
+        assert_eq!(tuner.tuning().profile, "low-overhead");
     }
 
     #[test]
@@ -9239,16 +9424,24 @@ mod tests {
     #[test]
     fn unsynced_peer_body_can_be_reused_from_decoded_cache() {
         let directory = tempfile::tempdir().unwrap();
-        let block = genesis_block(Network::Regtest);
+        let block = Arc::new(genesis_block(Network::Regtest));
         let hash = block.block_hash();
         let mut store = BlockStore::open(directory.path()).unwrap();
         store.configure_cache_size_mib(4);
         let prepared = BlockStore::prepare_record(&block).unwrap();
-        store.insert_prepared_unsynced(&block, prepared).unwrap();
-        store.cache_peer_block(&block);
+        store
+            .insert_prepared_unsynced_shared(Arc::clone(&block), prepared)
+            .unwrap();
+        store.cache_peer_block(Arc::clone(&block));
 
         assert_eq!(store.block_cache.len(), 1);
-        assert_eq!(store.get(&hash).unwrap(), Some(block));
+        let cached = store.get_shared(&hash).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&cached, &block));
+        let (metrics, entries, _) = store.take_cache_metrics();
+        assert_eq!(metrics.lookups, 1);
+        assert_eq!(metrics.hits, 1);
+        assert_eq!(metrics.misses, 0);
+        assert_eq!(entries, 1);
     }
 
     #[test]
@@ -9273,6 +9466,28 @@ mod tests {
                 directory.path().join(name).exists(),
                 "missing native file {name}"
             );
+        }
+    }
+
+    #[test]
+    fn append_preallocation_keeps_logical_record_lengths() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        let mut store = BlockStore::open(directory.path()).unwrap();
+        store.insert(&block).unwrap();
+        store.insert_undo(hash, &[Vec::new()]).unwrap();
+
+        assert_eq!(store.file.metadata().unwrap().len(), store.block_data_len);
+        assert_eq!(
+            store.undo_file.metadata().unwrap().len(),
+            store.undo_data_len
+        );
+        if store.block_preallocation_enabled {
+            assert!(store.block_preallocated_through >= BLOCK_PREALLOCATION_CHUNK_BYTES);
+        }
+        if store.undo_preallocation_enabled {
+            assert!(store.undo_preallocated_through >= UNDO_PREALLOCATION_CHUNK_BYTES);
         }
     }
 

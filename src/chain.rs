@@ -126,6 +126,48 @@ fn trim_process_heap() {
         libc::malloc_trim(0);
     }
 }
+
+#[derive(Clone, Copy, Default)]
+struct ProcessMemorySnapshot {
+    rss_bytes: u64,
+    available_bytes: u64,
+    total_bytes: u64,
+}
+
+fn kib_value(contents: &str, name: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let value = line.strip_prefix(name)?.split_whitespace().next()?;
+        value.parse::<u64>().ok()?.checked_mul(1024)
+    })
+}
+
+fn process_memory_snapshot() -> ProcessMemorySnapshot {
+    #[cfg(target_os = "linux")]
+    {
+        let rss_bytes = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|contents| kib_value(&contents, "VmRSS:"))
+            .unwrap_or(0);
+        let memory = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        ProcessMemorySnapshot {
+            rss_bytes,
+            available_bytes: kib_value(&memory, "MemAvailable:").unwrap_or(0),
+            total_bytes: kib_value(&memory, "MemTotal:").unwrap_or(0),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        ProcessMemorySnapshot::default()
+    }
+}
+
+fn system_memory_is_tight(memory: ProcessMemorySnapshot) -> bool {
+    if memory.available_bytes == 0 || memory.total_bytes == 0 {
+        return false;
+    }
+    let minimum_available = (memory.total_bytes / 20).max(2 * 1024 * 1024 * 1024);
+    memory.available_bytes < minimum_available
+}
 const FAST_PRUNE_BLOCKFILE_SIZE: usize = 0x10_000;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
@@ -1803,6 +1845,9 @@ pub struct ChainState {
     // so soon-to-be-spent coins do not evict useful recent outputs from the
     // long-lived decoded UTXO cache.
     ibd_batch_prefetched_utxos: FastHashMap<OutPoint, StoredUtxo>,
+    // Preserve the decoded allocations used to build the batch query so the
+    // connector does not look up and clone the same blocks a second time.
+    ibd_batch_prefetched_blocks: FastHashMap<BlockHash, Arc<Block>>,
     // Core's BLOCK_VALID_TRANSACTIONS/HaveNumChainTxs state is distinct from
     // merely having a body in the block store.  Keep the runtime equivalent
     // for bodies accepted by the peer path so the download scheduler can
@@ -1826,7 +1871,7 @@ pub struct ChainState {
     // consults this for every peer, so recomputing it from the entire block
     // index would turn each handshake into an O(number of headers) scan.
     best_header_hash: Mutex<Option<BlockHash>>,
-    orphans: HashMap<BlockHash, Vec<Block>>,
+    orphans: HashMap<BlockHash, Vec<Arc<Block>>>,
     invalid_blocks: HashSet<BlockHash>,
     prune_height: Option<u32>,
     prune_locks: HashMap<String, PruneLock>,
@@ -1879,6 +1924,8 @@ pub struct ChainState {
     peer_storage_blocks_since_flush: u32,
     peer_storage_bytes_since_flush: u64,
     ibd_connect_bench: IbdConnectBench,
+    ibd_heap_trim_rss_threshold: u64,
+    last_ibd_heap_trim_height: u32,
 }
 
 struct HeaderMerkleCache {
@@ -2645,6 +2692,7 @@ impl ChainState {
             pending_body_children: HashMap::new(),
             processing_known_children: false,
             ibd_batch_prefetched_utxos: FastHashMap::new(),
+            ibd_batch_prefetched_blocks: FastHashMap::new(),
             peer_body_chain_ready: HashSet::new(),
             unlinked_body_order: HashMap::new(),
             next_unlinked_body_order: 1,
@@ -2683,6 +2731,8 @@ impl ChainState {
             peer_storage_blocks_since_flush: 0,
             peer_storage_bytes_since_flush: 0,
             ibd_connect_bench: IbdConnectBench::default(),
+            ibd_heap_trim_rss_threshold: 8 * 1024 * 1024 * 1024,
+            last_ibd_heap_trim_height: 0,
         };
         let snapshot_load_started = Instant::now();
         let snapshot = if rebuild_chainstate {
@@ -3326,18 +3376,6 @@ impl ChainState {
         if !self.initial_block_download {
             return;
         }
-        // Returning allocator arenas to the OS is useful after a large
-        // parallel prefetch, but malloc_trim is itself a process-wide heap
-        // operation. Running it for every block made the unreported part of
-        // IBD slower than Core and distorted the 256-block benchmark rate.
-        // Keep the cleanup at the same cadence as the benchmark window.
-        let should_trim_heap = trim_heap
-            && self
-                .ibd_connect_bench
-                .utxo_prefetch
-                .saturating_add(timings.utxo_prefetch)
-                > Duration::from_millis(5)
-            && (self.ibd_connect_bench.blocks + 1) % IBD_BENCH_BLOCKS == 0;
         let bench = &mut self.ibd_connect_bench;
         bench.blocks = bench.blocks.saturating_add(1);
         bench.transactions = bench
@@ -3373,9 +3411,10 @@ impl ChainState {
         let (utxo_cache_entries, utxo_cache_bytes) = self.utxo_store.cache_stats();
         let (utxo_pending_entries, utxo_pending_bytes, utxo_clean_bytes, utxo_cache_limit) =
             self.utxo_store.pending_stats();
+        let (block_cache, block_cache_entries, block_cache_bytes) = self.store.take_cache_metrics();
         let benchmark_window = connect_benchmark_window(label, bench.blocks, height);
         info!(
-            "{benchmark_window} txs={} rate={blocks_per_second:.1} blocks/s txrate={transactions_per_second:.0} tx/s validation={:.2}s utxo_prefetch={:.2}s transaction_validation={:.2}s utxo_misses={} utxo_cache={} entries/{}MiB utxo_pending={} entries/{}MiB clean_cache={}MiB cache_limit={}MiB undo_filters={:.2}s block_delta_storage={:.2}s state_mutation={:.2}s tx_indexes={:.2}s utxo_index={:.2}s history_index={:.2}s finalization={:.2}s total={total_seconds:.2}s",
+            "{benchmark_window} txs={} rate={blocks_per_second:.1} blocks/s txrate={transactions_per_second:.0} tx/s validation={:.2}s utxo_prefetch={:.2}s transaction_validation={:.2}s utxo_misses={} utxo_cache={} entries/{}MiB utxo_pending={} entries/{}MiB clean_cache={}MiB cache_limit={}MiB block_cache_hits={} block_cache_misses={} block_cache={} entries/{}MiB block_lookup={:.2}s block_load={:.2}s block_decode={:.2}s undo_filters={:.2}s block_delta_storage={:.2}s state_mutation={:.2}s tx_indexes={:.2}s utxo_index={:.2}s history_index={:.2}s finalization={:.2}s total={total_seconds:.2}s",
             bench.transactions,
             bench.validation.as_secs_f64(),
             bench.utxo_prefetch.as_secs_f64(),
@@ -3387,6 +3426,13 @@ impl ChainState {
             utxo_pending_bytes / (1024 * 1024),
             utxo_clean_bytes / (1024 * 1024),
             utxo_cache_limit / (1024 * 1024),
+            block_cache.hits,
+            block_cache.misses,
+            block_cache_entries,
+            block_cache_bytes / (1024 * 1024),
+            block_cache.lookup_time.as_secs_f64(),
+            block_cache.load_time.as_secs_f64(),
+            block_cache.decode_time.as_secs_f64(),
             bench.undo_and_filters.as_secs_f64(),
             bench.block_and_delta_storage.as_secs_f64(),
             bench.state_mutation.as_secs_f64(),
@@ -3395,12 +3441,33 @@ impl ChainState {
             bench.history_index.as_secs_f64(),
             bench.finalization.as_secs_f64(),
         );
-        // A block-sized prefetch batch releases many decoded values and wire
-        // buffers. glibc otherwise retains those pages in worker arenas until
-        // the much later 65,536-block storage flush, creating the RSS slope
-        // that does not exist in Core's long-lived coin cache.
+        // malloc_trim is process-wide and can be expensive with many worker
+        // arenas. Run it only when RSS has escaped the configured cache
+        // budget or the host is genuinely short of memory, and no more often
+        // than once per 8,192 connected blocks. Large durability checkpoints
+        // retain their explicit trim independently of this pressure path.
+        let memory_before = process_memory_snapshot();
+        let rss_pressure = memory_before.rss_bytes >= self.ibd_heap_trim_rss_threshold;
+        let system_pressure = system_memory_is_tight(memory_before);
+        let should_trim_heap = trim_heap
+            && height.saturating_sub(self.last_ibd_heap_trim_height) >= 8_192
+            && (rss_pressure || system_pressure);
         if should_trim_heap {
+            self.last_ibd_heap_trim_height = height;
+            let trim_started = Instant::now();
             trim_process_heap();
+            let memory_after = process_memory_snapshot();
+            info!(
+                height,
+                rss_before_mib = memory_before.rss_bytes / (1024 * 1024),
+                rss_after_mib = memory_after.rss_bytes / (1024 * 1024),
+                available_mib = memory_after.available_bytes / (1024 * 1024),
+                rss_threshold_mib = self.ibd_heap_trim_rss_threshold / (1024 * 1024),
+                rss_pressure,
+                system_pressure,
+                elapsed = ?trim_started.elapsed(),
+                "Trimmed allocator arenas under IBD memory pressure"
+            );
         }
     }
 
@@ -4846,6 +4913,15 @@ impl ChainState {
         self.store.configure_cache_size_mib(mib);
         self.utxo_store
             .configure_cache_size_mib_with_mempool(mib, max_mempool_bytes);
+        let cache_bytes = u64::try_from(mib.max(0))
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1024 * 1024);
+        let mempool_bytes = u64::try_from(max_mempool_bytes).unwrap_or(u64::MAX);
+        let allocator_headroom =
+            (cache_bytes / 2).clamp(4 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
+        self.ibd_heap_trim_rss_threshold = cache_bytes
+            .saturating_add(mempool_bytes)
+            .saturating_add(allocator_headroom);
     }
 
     /// Optionally tune IBD UTXO read batching from observed lookup
@@ -8106,17 +8182,26 @@ impl ChainState {
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
+        self.connect_shared_block(Arc::new(block))
+    }
+
+    pub(crate) fn connect_shared_block(&mut self, block: Arc<Block>) -> Result<ChainTip> {
         self.connect_block_with_existing_body(block, None, false, false, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn connect_block_from_peer(&mut self, block: Block) -> Result<ChainTip> {
+        self.connect_shared_block_from_peer(Arc::new(block))
+    }
+
+    pub(crate) fn connect_shared_block_from_peer(&mut self, block: Arc<Block>) -> Result<ChainTip> {
         let prepared = BlockStore::prepare_record(&block)?;
         self.connect_prepared_block_from_peer(block, prepared)
     }
 
     pub(crate) fn connect_prepared_block_from_peer(
         &mut self,
-        block: Block,
+        block: Arc<Block>,
         prepared: PreparedBlockRecord,
     ) -> Result<ChainTip> {
         let hash = block.block_hash();
@@ -8195,7 +8280,7 @@ impl ChainState {
 
     fn connect_block_with_existing_body(
         &mut self,
-        block: Block,
+        block: Arc<Block>,
         mut prepared_record: Option<PreparedBlockRecord>,
         allow_existing_body: bool,
         retain_invalid_body: bool,
@@ -8601,15 +8686,16 @@ impl ChainState {
 
     fn insert_side_chain_body(
         &mut self,
-        block: &Block,
+        block: &Arc<Block>,
         prepared_record: &mut Option<PreparedBlockRecord>,
     ) -> Result<()> {
         if let Some(prepared) = prepared_record.take() {
-            self.store.insert_prepared_unsynced(block, prepared)?;
+            self.store
+                .insert_prepared_unsynced_shared(Arc::clone(block), prepared)?;
         } else {
             self.store.insert_unsynced(block)?;
         }
-        self.store.cache_peer_block(block);
+        self.store.cache_peer_block(Arc::clone(block));
         self.persist_transaction_index_for_block_unsynced(block)?;
         let hash = block.block_hash();
         let children = self
@@ -8634,7 +8720,7 @@ impl ChainState {
         }
     }
 
-    fn queue_orphan_block(&mut self, parent_hash: BlockHash, block: Block) -> Result<()> {
+    fn queue_orphan_block(&mut self, parent_hash: BlockHash, block: Arc<Block>) -> Result<()> {
         let hash = block.block_hash();
         if self
             .orphans
@@ -8669,6 +8755,7 @@ impl ChainState {
         parent_hash: BlockHash,
     ) -> Result<Option<BlockHash>> {
         self.ibd_batch_prefetched_utxos.clear();
+        self.ibd_batch_prefetched_blocks.clear();
         let tuning = self.utxo_store.prefetch_tuning();
         let mut hashes = Vec::with_capacity(tuning.max_blocks);
         let mut cursor = parent_hash;
@@ -8719,7 +8806,7 @@ impl ChainState {
             self.check_shutdown_interrupt()?;
             let block = self
                 .store
-                .get(hash)?
+                .get_shared(hash)?
                 .with_context(|| format!("stored IBD prefetch block {hash} is missing"))?;
             let transaction_ids = block_transaction_ids(&block);
             let node = self
@@ -8742,6 +8829,8 @@ impl ChainState {
             }
             lookup_outpoints.extend(block_outpoints);
             earlier_block_txids.extend(transaction_ids);
+            self.ibd_batch_prefetched_blocks
+                .insert(*hash, Arc::clone(&block));
             prefetched_blocks += 1;
         }
         if prefetched_blocks < IBD_UTXO_PREFETCH_MIN_BLOCKS {
@@ -8831,9 +8920,15 @@ impl ChainState {
                         .then_with(|| left.to_string().cmp(&right.to_string()))
                 });
                 for child_hash in children {
-                    let Ok(Some(child)) = self.store.get(&child_hash) else {
-                        continue;
-                    };
+                    let child =
+                        if let Some(child) = self.ibd_batch_prefetched_blocks.remove(&child_hash) {
+                            child
+                        } else {
+                            let Ok(Some(child)) = self.store.get_shared(&child_hash) else {
+                                continue;
+                            };
+                            child
+                        };
                     // These are peer bodies retained while an earlier body
                     // was missing. Re-enter them with peer semantics so an
                     // inactive parent does not trigger reconstruction of a
@@ -8893,6 +8988,7 @@ impl ChainState {
         })();
         self.processing_known_children = false;
         self.ibd_batch_prefetched_utxos.clear();
+        self.ibd_batch_prefetched_blocks.clear();
         result
     }
 
@@ -11001,7 +11097,7 @@ impl ChainState {
             self.check_shutdown_interrupt()?;
             for (hash, _) in children {
                 if let Some(block) = self.store.get(&hash)? {
-                    let _ = self.queue_orphan_block(parent_hash, block);
+                    let _ = self.queue_orphan_block(parent_hash, Arc::new(block));
                 }
             }
         }
@@ -13973,6 +14069,7 @@ fn open_background_replay_state(
         pending_body_children: HashMap::new(),
         processing_known_children: false,
         ibd_batch_prefetched_utxos: FastHashMap::new(),
+        ibd_batch_prefetched_blocks: FastHashMap::new(),
         peer_body_chain_ready: HashSet::new(),
         unlinked_body_order: HashMap::new(),
         next_unlinked_body_order: 1,
@@ -14011,6 +14108,8 @@ fn open_background_replay_state(
         peer_storage_blocks_since_flush: 0,
         peer_storage_bytes_since_flush: 0,
         ibd_connect_bench: IbdConnectBench::default(),
+        ibd_heap_trim_rss_threshold: 8 * 1024 * 1024 * 1024,
+        last_ibd_heap_trim_height: 0,
     })
 }
 

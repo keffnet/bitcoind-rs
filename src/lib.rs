@@ -1598,8 +1598,7 @@ impl PeerBlockProcessingGate {
         }
     }
 
-    #[cfg(test)]
-    fn waiter_count(&self) -> usize {
+    pub(crate) fn waiter_count(&self) -> usize {
         self.state.lock().waiters.len()
     }
 }
@@ -1644,6 +1643,21 @@ struct ChainSyncTimeoutState {
     work_hash: Option<BlockHash>,
     sent_getheaders: bool,
     protect: bool,
+}
+
+#[derive(Default)]
+struct IbdPeerPipelineBench {
+    bodies: u32,
+    preparation_queue: Duration,
+    preparation_work: Duration,
+    admission_wait: Duration,
+    chain_task: Duration,
+    end_to_end: Duration,
+    max_preparation_queue: Duration,
+    max_admission_wait: Duration,
+    max_chain_task: Duration,
+    max_end_to_end: Duration,
+    max_gate_waiters: usize,
 }
 
 pub(crate) enum OutboundEvictionAction {
@@ -2039,6 +2053,7 @@ pub struct Node {
     /// Serialization and compression happen before this gate, so CPU-heavy
     /// preparation remains parallel without a convoy of competing writers.
     pub(crate) peer_block_processing: Arc<PeerBlockProcessingGate>,
+    ibd_peer_pipeline_bench: Mutex<IbdPeerPipelineBench>,
     /// Bound the number of received IBD bodies that may wait for ordered
     /// chainstate activation. The peer reader must keep draining the socket
     /// while the single chain-mutation lane validates an earlier block.
@@ -2704,6 +2719,7 @@ impl Node {
             banlist_recreated: !banlist_exists,
             mining_lock: Mutex::new(()),
             peer_block_processing: Arc::new(PeerBlockProcessingGate::new()),
+            ibd_peer_pipeline_bench: Mutex::new(IbdPeerPipelineBench::default()),
             // Keep parsed bodies bounded separately from Core's wire request
             // window. A parsed block is much larger than its wire payload;
             // sixty-four queued bodies preserve reader/validator overlap
@@ -2799,7 +2815,61 @@ impl Node {
         Ok(node)
     }
 
+    pub(crate) fn record_ibd_peer_pipeline(
+        &self,
+        preparation_queue: Duration,
+        preparation_work: Duration,
+        admission_wait: Duration,
+        chain_task: Duration,
+        end_to_end: Duration,
+        gate_waiters: usize,
+    ) {
+        if !self.chain.read().is_initial_block_download() {
+            return;
+        }
+        let mut bench = self.ibd_peer_pipeline_bench.lock();
+        bench.bodies = bench.bodies.saturating_add(1);
+        bench.preparation_queue += preparation_queue;
+        bench.preparation_work += preparation_work;
+        bench.admission_wait += admission_wait;
+        bench.chain_task += chain_task;
+        bench.end_to_end += end_to_end;
+        bench.max_preparation_queue = bench.max_preparation_queue.max(preparation_queue);
+        bench.max_admission_wait = bench.max_admission_wait.max(admission_wait);
+        bench.max_chain_task = bench.max_chain_task.max(chain_task);
+        bench.max_end_to_end = bench.max_end_to_end.max(end_to_end);
+        bench.max_gate_waiters = bench.max_gate_waiters.max(gate_waiters);
+        if bench.bodies < 256 {
+            return;
+        }
+        let bench = std::mem::take(&mut *bench);
+        let bodies = f64::from(bench.bodies);
+        info!(
+            bodies = bench.bodies,
+            preparation_queue = bench.preparation_queue.as_secs_f64(),
+            preparation_work = bench.preparation_work.as_secs_f64(),
+            admission_wait = bench.admission_wait.as_secs_f64(),
+            chain_task = bench.chain_task.as_secs_f64(),
+            end_to_end = bench.end_to_end.as_secs_f64(),
+            avg_preparation_queue_ms = bench.preparation_queue.as_secs_f64() * 1_000.0 / bodies,
+            avg_preparation_work_ms = bench.preparation_work.as_secs_f64() * 1_000.0 / bodies,
+            avg_admission_wait_ms = bench.admission_wait.as_secs_f64() * 1_000.0 / bodies,
+            avg_chain_task_ms = bench.chain_task.as_secs_f64() * 1_000.0 / bodies,
+            avg_end_to_end_ms = bench.end_to_end.as_secs_f64() * 1_000.0 / bodies,
+            max_preparation_queue_ms = bench.max_preparation_queue.as_secs_f64() * 1_000.0,
+            max_admission_wait_ms = bench.max_admission_wait.as_secs_f64() * 1_000.0,
+            max_chain_task_ms = bench.max_chain_task.as_secs_f64() * 1_000.0,
+            max_end_to_end_ms = bench.max_end_to_end.as_secs_f64() * 1_000.0,
+            max_gate_waiters = bench.max_gate_waiters,
+            "IBD peer pipeline benchmark"
+        );
+    }
+
     pub fn connect_block(&self, block: Block) -> Result<ChainEvent> {
+        self.connect_block_with_policy(Arc::new(block), false, None)
+    }
+
+    pub(crate) fn connect_shared_block(&self, block: Arc<Block>) -> Result<ChainEvent> {
         self.connect_block_with_policy(block, false, None)
     }
 
@@ -2820,12 +2890,12 @@ impl Node {
         // can prepare in parallel instead of funneling zstd level 6 through
         // the serialized consensus mutation path.
         let prepared = BlockStore::prepare_record(&block)?;
-        self.connect_block_with_policy(block, true, Some(prepared))
+        self.connect_block_with_policy(Arc::new(block), true, Some(prepared))
     }
 
     pub(crate) fn connect_prepared_block_from_peer(
         &self,
-        block: Block,
+        block: Arc<Block>,
         prepared: PreparedBlockRecord,
     ) -> Result<ChainEvent> {
         self.connect_block_with_policy(block, true, Some(prepared))
@@ -2833,7 +2903,7 @@ impl Node {
 
     fn connect_block_with_policy(
         &self,
-        block: Block,
+        block: Arc<Block>,
         retain_invalid_body: bool,
         prepared_record: Option<PreparedBlockRecord>,
     ) -> Result<ChainEvent> {
@@ -2864,10 +2934,10 @@ impl Node {
                 if let Some(prepared) = prepared_record {
                     chain.connect_prepared_block_from_peer(block, prepared)
                 } else {
-                    chain.connect_block_from_peer(block)
+                    chain.connect_shared_block_from_peer(block)
                 }
             } else {
-                chain.connect_block(block)
+                chain.connect_shared_block(block)
             };
             let tip = match tip_result {
                 Ok(tip) => tip,

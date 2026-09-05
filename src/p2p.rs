@@ -681,7 +681,10 @@ fn handle_headers_download_timeout(
     // within a day of the node clock. This matters for mocktime-driven tests:
     // a recent chain may legitimately have an unanswered getheaders request,
     // but it must not be disconnected merely because mocktime advances.
-    if node.best_header_is_recent() {
+    let Some(best_header_is_recent) = node.try_best_header_is_recent() else {
+        return Ok(false);
+    };
+    if best_header_is_recent {
         *peer_state.last_headers_request.lock() = None;
         *peer_state.last_headers_request_time.lock() = None;
         return Ok(false);
@@ -1501,45 +1504,51 @@ impl TxRequestState {
     }
 
     fn remove(&mut self, key: TxRequestKey) {
-        self.pending.retain(|request| request.key != key);
-        self.pending_keys.remove(&key);
+        if self.pending_keys.remove(&key) {
+            self.pending.retain(|request| request.key != key);
+        }
         self.in_flight.remove(&key);
     }
 
-    fn remove_transaction(&mut self, transaction: &Transaction) {
-        self.remove(TxRequestKey {
-            witness: false,
-            hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
-        });
-        // Orphan-parent requests use MSG_TX | MSG_WITNESS_FLAG: the hash is
-        // a txid, but the request key is still witness-bearing.
-        self.remove(TxRequestKey {
-            witness: true,
-            hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
-        });
-        self.remove(TxRequestKey {
-            witness: true,
-            hash: BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
-        });
+    fn is_empty(&self) -> bool {
+        self.pending_keys.is_empty() && self.in_flight.is_empty()
     }
 
-    fn contains_transaction(&self, transaction: &Transaction) -> bool {
+    fn transaction_keys(transaction: &Transaction) -> [TxRequestKey; 3] {
+        let txid = BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash());
+        let wtxid = BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash());
         [
             TxRequestKey {
                 witness: false,
-                hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
+                hash: txid,
+            },
+            // Orphan-parent requests use MSG_TX | MSG_WITNESS_FLAG: the hash is
+            // a txid, but the request key is still witness-bearing.
+            TxRequestKey {
+                witness: true,
+                hash: txid,
             },
             TxRequestKey {
                 witness: true,
-                hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
-            },
-            TxRequestKey {
-                witness: true,
-                hash: BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
+                hash: wtxid,
             },
         ]
-        .into_iter()
-        .any(|key| self.pending_keys.contains(&key) || self.in_flight.contains_key(&key))
+    }
+
+    fn remove_transaction(&mut self, transaction: &Transaction) {
+        if self.is_empty() {
+            return;
+        }
+        for key in Self::transaction_keys(transaction) {
+            self.remove(key);
+        }
+    }
+
+    fn contains_transaction(&self, transaction: &Transaction) -> bool {
+        !self.is_empty()
+            && Self::transaction_keys(transaction)
+                .into_iter()
+                .any(|key| self.pending_keys.contains(&key) || self.in_flight.contains_key(&key))
     }
 
     fn remove_inventory(&mut self, item: &Inventory) {
@@ -6876,9 +6885,7 @@ async fn serve_peer_loop(
                         block.header.prev_blockhash
                     );
                 }
-                for transaction in &block.txdata {
-                    forget_transaction_requests(peers, transaction);
-                }
+                forget_transaction_batch_requests(peers, &block.txdata);
                 let disconnect_on_invalid =
                     !peer_state.permissions.contains(PeerPermissions::NO_BAN);
 
@@ -6946,7 +6953,6 @@ async fn serve_peer_loop(
                                             );
                                             queued_node.disconnect_peer(peer_id);
                                         }
-                                        queued_node.record_peer_block(peer_id, hash);
                                     }
                                     Ok(false) => {}
                                     Err(error) => {
@@ -6997,7 +7003,6 @@ async fn serve_peer_loop(
                         compact_reconstruction_failed = None;
                     }
                     flush_pending_block_serves(node, peers, hash).await?;
-                    node.record_peer_block(peer_id, hash);
                     if !was_stored {
                         maybe_select_peer_bip152_highbandwidth(
                             node,
@@ -7144,9 +7149,7 @@ async fn serve_peer_loop(
                                 let block_hash = block.block_hash();
                                 suppress_block_relay(peer_state, block_hash);
                                 let was_stored = node.chain.read().store.contains(&block_hash);
-                                for transaction in &block.txdata {
-                                    forget_transaction_requests(peers, transaction);
-                                }
+                                forget_transaction_batch_requests(peers, &block.txdata);
                                 if handle_received_block(
                                     node,
                                     peer_id,
@@ -7159,7 +7162,6 @@ async fn serve_peer_loop(
                                 .await?
                                 {
                                     flush_pending_block_serves(node, peers, block_hash).await?;
-                                    node.record_peer_block(peer_id, block_hash);
                                     if !was_stored {
                                         maybe_select_peer_bip152_highbandwidth(
                                             node,
@@ -7401,9 +7403,7 @@ async fn serve_peer_loop(
                         let block_hash = block.block_hash();
                         suppress_block_relay(peer_state, block_hash);
                         let was_stored = node.chain.read().store.contains(&block_hash);
-                        for transaction in &block.txdata {
-                            forget_transaction_requests(peers, transaction);
-                        }
+                        forget_transaction_batch_requests(peers, &block.txdata);
                         let accepted = handle_received_block(
                             node,
                             peer_id,
@@ -7419,7 +7419,6 @@ async fn serve_peer_loop(
                                 compact_reconstruction_failed = None;
                             }
                             flush_pending_block_serves(node, peers, block_hash).await?;
-                            node.record_peer_block(peer_id, block_hash);
                             if !was_stored {
                                 maybe_select_peer_bip152_highbandwidth(
                                     node,
@@ -8196,18 +8195,15 @@ fn basic_filter_range(
     Ok(Some(range))
 }
 
-async fn handle_received_block(
+fn check_received_unrequested_block(
     node: &Arc<Node>,
     peer_id: usize,
-    block: Block,
-    requested: bool,
-    enforce_unrequested_gate: bool,
+    block: &Block,
     disconnect_on_invalid: bool,
-    received_at: Instant,
 ) -> Result<bool> {
     let hash = block.block_hash();
-    if enforce_unrequested_gate && !requested {
-        let prevalidation = node.chain.read().validate_block_before_header(&block);
+    {
+        let prevalidation = node.chain.read().validate_block_before_header(block);
         if let Err(error) = prevalidation {
             return handle_peer_block_validation_error(
                 node,
@@ -8271,13 +8267,61 @@ async fn handle_received_block(
         }
         let allowed = {
             let chain = node.chain.read();
-            unrequested_block_is_allowed(&block, &chain)
+            unrequested_block_is_allowed(block, &chain)
         };
         if !allowed {
             debug!(%hash, "ignored unrequested low-work or distant peer block");
             return Ok(false);
         }
     }
+    Ok(true)
+}
+
+async fn received_block_height(node: &Arc<Node>, peer_id: usize, hash: BlockHash) -> Result<u32> {
+    if let Some(height) = node.peer_block_request_height(peer_id, hash) {
+        return Ok(height);
+    }
+    let node = Arc::clone(node);
+    tokio::task::spawn_blocking(move || {
+        node.chain
+            .read()
+            .block_height_by_hash(&hash)
+            .unwrap_or(u32::MAX)
+    })
+    .await
+    .context("peer block height lookup failed")
+}
+
+async fn handle_received_block(
+    node: &Arc<Node>,
+    peer_id: usize,
+    block: Block,
+    requested: bool,
+    enforce_unrequested_gate: bool,
+    disconnect_on_invalid: bool,
+    received_at: Instant,
+) -> Result<bool> {
+    let hash = block.block_hash();
+    let block = if enforce_unrequested_gate && !requested {
+        let checking_node = Arc::clone(node);
+        let (block, allowed) = tokio::task::spawn_blocking(move || {
+            let allowed = check_received_unrequested_block(
+                &checking_node,
+                peer_id,
+                &block,
+                disconnect_on_invalid,
+            );
+            (block, allowed)
+        })
+        .await
+        .context("unrequested peer block check failed")?;
+        if !allowed? {
+            return Ok(false);
+        }
+        block
+    } else {
+        block
+    };
     // Serialize and compress bodies in parallel before entering the single
     // chain-mutation lane. Keeping the permit out of preparation lets all CPU
     // cores contribute without allowing competing chain writers to form a
@@ -8286,11 +8330,9 @@ async fn handle_received_block(
     let (block, prepared, preparation_queue_elapsed, preparation_work_elapsed) =
         prepare_peer_block(block).await?;
     let preparation_elapsed = preparation_started.elapsed();
-    let block_height = node
-        .chain
-        .read()
-        .block_height_by_hash(&hash)
-        .unwrap_or(u32::MAX);
+    let height_lookup_started = Instant::now();
+    let block_height = received_block_height(node, peer_id, hash).await?;
+    let height_lookup_elapsed = height_lookup_started.elapsed();
     let queue_wait_started = Instant::now();
     let peer_block_processing = node.peer_block_processing.acquire(block_height).await;
     let queue_wait_elapsed = queue_wait_started.elapsed();
@@ -8309,28 +8351,60 @@ async fn handle_received_block(
         );
     }
     let validation_node = Arc::clone(node);
-    let chain_task_started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || {
-        if disconnect_on_invalid {
-            validation_node.connect_prepared_block_from_peer(block, prepared)
-        } else {
-            validation_node.connect_shared_block(block)
-        }
-    })
-    .await
-    .context("peer block validation task failed")?;
-    let chain_task_elapsed = chain_task_started.elapsed();
-    // The gate protects only chain mutation. Peer bookkeeping and logging do
-    // not need to delay admission of the next already-prepared body.
-    drop(peer_block_processing);
+    let dispatch_started = Instant::now();
+    let (result, in_initial_block_download, dispatch_wait, chain_task_elapsed, finished) =
+        tokio::task::spawn_blocking(move || {
+            let _peer_block_processing = peer_block_processing;
+            let chain_task_started = Instant::now();
+            let dispatch_wait = chain_task_started.duration_since(dispatch_started);
+            let result = if disconnect_on_invalid {
+                validation_node.connect_prepared_block_from_peer(block, prepared)
+            } else {
+                validation_node.connect_shared_block(block)
+            };
+            let in_initial_block_download =
+                validation_node.chain.read().is_initial_block_download();
+            let result = finish_received_block(
+                &validation_node,
+                peer_id,
+                hash,
+                result,
+                disconnect_on_invalid,
+            );
+            (
+                result,
+                in_initial_block_download,
+                dispatch_wait,
+                chain_task_started.elapsed(),
+                Instant::now(),
+            )
+        })
+        .await
+        .context("peer block validation task failed")?;
     node.record_ibd_peer_pipeline(
-        preparation_queue_elapsed,
-        preparation_work_elapsed,
-        queue_wait_elapsed,
-        chain_task_elapsed,
-        received_at.elapsed(),
+        crate::PeerBlockPipelineTiming {
+            preparation_queue: preparation_queue_elapsed,
+            preparation_work: preparation_work_elapsed,
+            height_lookup: height_lookup_elapsed,
+            admission_wait: queue_wait_elapsed,
+            dispatch_wait,
+            chain_task: chain_task_elapsed,
+            completion_wait: finished.elapsed(),
+            end_to_end: received_at.elapsed(),
+        },
         gate_waiters,
+        in_initial_block_download,
     );
+    result
+}
+
+fn finish_received_block(
+    node: &Arc<Node>,
+    peer_id: usize,
+    hash: BlockHash,
+    result: Result<crate::ChainEvent>,
+    disconnect_on_invalid: bool,
+) -> Result<bool> {
     match result {
         Ok(tip) => {
             let (active, block_height) = {
@@ -8363,6 +8437,7 @@ async fn handle_received_block(
             }
             node.clear_peer_block_requests_for_hash(hash);
             node.update_peer_best_known_block(peer_id, hash);
+            node.record_peer_block(peer_id, hash);
             Ok(true)
         }
         Err(error) => {
@@ -8628,8 +8703,10 @@ async fn flush_pending_block_requests(
         if node.block_request_in_flight(request.hash) {
             continue;
         }
-        if node.track_ibd_peer_block_request(peer_id, request.hash) {
-            requests.push(request);
+        match node.track_ibd_peer_block_request(peer_id, request.hash) {
+            Some(true) => requests.push(request),
+            Some(false) => {}
+            None => remaining.push(request),
         }
     }
     *pending = remaining;
@@ -9724,8 +9801,33 @@ fn preferred_peer_has_pending_request(
 }
 
 fn forget_transaction_requests(peers: &PeerRegistry, transaction: &Transaction) {
-    for state in peers.lock().values() {
-        state.tx_requests.lock().remove_transaction(transaction);
+    forget_transaction_batch_requests(peers, std::slice::from_ref(transaction));
+}
+
+fn forget_transaction_batch_requests(peers: &PeerRegistry, transactions: &[Transaction]) {
+    let states = peers.lock().values().cloned().collect::<Vec<_>>();
+    clear_transaction_request_trackers(states.iter().map(|state| &state.tx_requests), transactions);
+}
+
+fn clear_transaction_request_trackers<'a>(
+    trackers: impl IntoIterator<Item = &'a parking_lot::Mutex<TxRequestState>>,
+    transactions: &[Transaction],
+) {
+    let mut keys = None;
+    for tracker in trackers {
+        let mut requests = tracker.lock();
+        if requests.is_empty() {
+            continue;
+        }
+        let keys = keys.get_or_insert_with(|| {
+            transactions
+                .iter()
+                .flat_map(TxRequestState::transaction_keys)
+                .collect::<Vec<_>>()
+        });
+        for key in keys.iter().copied() {
+            requests.remove(key);
+        }
     }
 }
 
@@ -10186,7 +10288,13 @@ async fn flush_pending_block_relay(
 
     let (headers, revert_to_inv, tip_known) = {
         let (best_known, last_header_sent) = peer_header_state(node, state, peer_id);
-        let chain = node.chain.read();
+        let Some(chain) = node.chain.try_read() else {
+            let mut pending = state.pending_block_relay.lock();
+            let newer = std::mem::take(&mut *pending);
+            *pending = hashes;
+            pending.extend(newer);
+            return Ok(());
+        };
         let peer_knows = |hash: &BlockHash| {
             [best_known, last_header_sent]
                 .into_iter()
@@ -11101,6 +11209,102 @@ mod tests {
         node.request_shutdown();
 
         assert!(waiter.await.is_err());
+    }
+
+    async fn hold_test_chain_writer(
+        node: &Arc<Node>,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let node = Arc::clone(node);
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _chain = node.chain.write();
+            let _ = ready.send(());
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        });
+        waiting.await.unwrap();
+        (release, worker)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_block_height_lookup_does_not_block_the_network_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(private_broadcast_test_config(
+            directory.path(),
+            false,
+            Vec::new(),
+        ))
+        .unwrap();
+        let hash = node.chain.read().best_hash();
+        let (release, worker) = hold_test_chain_writer(&node).await;
+        let started = Instant::now();
+        let lookup = received_block_height(&node, 1, hash);
+        tokio::pin!(lookup);
+        let pending = tokio::time::timeout(Duration::from_millis(20), &mut lookup)
+            .await
+            .is_err();
+        let responsive = started.elapsed() < Duration::from_secs(1);
+        let _ = release.send(());
+        worker.join().unwrap();
+        assert!(pending);
+        assert!(responsive);
+        assert_eq!(lookup.await.unwrap(), 0);
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        assert!(node.track_peer_block_request(1, hash));
+        let (release, worker) = hold_test_chain_writer(&node).await;
+        let started = Instant::now();
+        let height = received_block_height(&node, 1, hash).await.unwrap();
+        let responsive = started.elapsed() < Duration::from_secs(1);
+        let _ = release.send(());
+        worker.join().unwrap();
+        assert!(responsive);
+        assert_eq!(height, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_peer_block_task_keeps_the_validation_lane_reserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(private_broadcast_test_config(
+            directory.path(),
+            false,
+            Vec::new(),
+        ))
+        .unwrap();
+        let previous = *node.chain.read().header(0).unwrap();
+        let block = mine_private_broadcast_block(&previous, 1, unix_time_seconds() as u32);
+        let hash = block.block_hash();
+        node.chain.write().accept_headers(&[block.header]).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        assert!(node.track_peer_block_request(1, hash));
+        let (release, worker) = hold_test_chain_writer(&node).await;
+        let task_node = Arc::clone(&node);
+        let task = tokio::spawn(async move {
+            handle_received_block(&task_node, 1, block, true, true, true, Instant::now()).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !node.peer_block_processing.state.lock().active {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let still_reserved = node.peer_block_processing.state.lock().active;
+        let _ = release.send(());
+        worker.join().unwrap();
+        assert!(still_reserved);
+        let _permit = tokio::time::timeout(
+            Duration::from_secs(2),
+            node.peer_block_processing.acquire(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.chain.read().best_hash(), hash);
+        assert!(!node.peer_has_inflight_block_request(1, hash));
     }
 
     fn mine_private_broadcast_block(previous: &Header, height: u32, now: u32) -> Block {
@@ -12082,6 +12286,117 @@ mod tests {
             transaction_request_delay(false, false, true, true),
             NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY + OVERLOADED_PEER_TX_DELAY
         );
+    }
+
+    #[test]
+    fn batched_transaction_cleanup_removes_all_request_forms_and_preserves_others() {
+        let mut transaction =
+            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+                .txdata
+                .remove(0);
+        transaction.input[0].witness = bitcoin::Witness::from_slice(&[&[1u8, 2, 3]]);
+        assert_ne!(
+            transaction.compute_txid().to_raw_hash(),
+            transaction.compute_wtxid().to_raw_hash()
+        );
+        let now = Instant::now();
+        let trackers = (0..3)
+            .map(|_| parking_lot::Mutex::new(TxRequestState::default()))
+            .collect::<Vec<_>>();
+        let unrelated = Inventory {
+            kind: InventoryType::Transaction,
+            hash: BlockHash::from_byte_array([0x42; 32]),
+        };
+        for (index, tracker) in trackers.iter().take(2).enumerate() {
+            let mut requests = tracker.lock();
+            for key in TxRequestState::transaction_keys(&transaction) {
+                requests.requeue(
+                    PendingTxRequest {
+                        key,
+                        item: Inventory {
+                            kind: InventoryType::WitnessTransaction,
+                            hash: key.hash,
+                        },
+                        ready_at: now,
+                        ready_at_mock: None,
+                    },
+                    now,
+                );
+            }
+            if index == 1 {
+                for request in requests.take_ready(now, usize::MAX) {
+                    requests.mark_sent(&request, now);
+                }
+            }
+            assert!(requests.queue(unrelated.clone(), now));
+            assert!(requests.contains_transaction(&transaction));
+        }
+        clear_transaction_request_trackers(&trackers, std::slice::from_ref(&transaction));
+        for tracker in trackers.iter().take(2) {
+            let requests = tracker.lock();
+            assert!(!requests.contains_transaction(&transaction));
+            assert!(requests.in_flight.is_empty());
+            assert_eq!(requests.pending.len(), 1);
+            assert_eq!(requests.pending_keys.len(), 1);
+            assert_eq!(requests.pending[0].item, unrelated);
+        }
+        assert!(trackers[2].lock().is_empty());
+        clear_transaction_request_trackers(&trackers, std::slice::from_ref(&transaction));
+        assert_eq!(trackers[0].lock().pending.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "microbenchmark: run with --release --ignored --nocapture"]
+    fn benchmark_ibd_empty_transaction_request_cleanup() {
+        let mut transaction =
+            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+                .txdata
+                .remove(0);
+        transaction.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 512]);
+        let transactions = vec![transaction; 2_000];
+        let trackers = (0..16)
+            .map(|_| parking_lot::Mutex::new(TxRequestState::default()))
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        for _ in 0..16 {
+            for transaction in &transactions {
+                for tracker in &trackers {
+                    let mut requests = tracker.lock();
+                    for key in [
+                        TxRequestKey {
+                            witness: false,
+                            hash: BlockHash::from_raw_hash(
+                                transaction.compute_txid().to_raw_hash(),
+                            ),
+                        },
+                        TxRequestKey {
+                            witness: true,
+                            hash: BlockHash::from_raw_hash(
+                                transaction.compute_txid().to_raw_hash(),
+                            ),
+                        },
+                        TxRequestKey {
+                            witness: true,
+                            hash: BlockHash::from_raw_hash(
+                                transaction.compute_wtxid().to_raw_hash(),
+                            ),
+                        },
+                    ] {
+                        requests.remove(std::hint::black_box(key));
+                    }
+                }
+            }
+        }
+        let before = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..16 {
+            clear_transaction_request_trackers(&trackers, std::hint::black_box(&transactions));
+        }
+        let after = started.elapsed();
+        eprintln!(
+            "empty transaction-request cleanup: 16 blocks x 2000 transactions x 16 peers; before={before:?} after={after:?}"
+        );
+        assert!(trackers.iter().all(|tracker| tracker.lock().is_empty()));
     }
 
     #[test]

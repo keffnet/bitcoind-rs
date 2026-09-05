@@ -1646,6 +1646,18 @@ struct ChainSyncTimeoutState {
 }
 
 #[derive(Default)]
+pub(crate) struct PeerBlockPipelineTiming {
+    pub(crate) preparation_queue: Duration,
+    pub(crate) preparation_work: Duration,
+    pub(crate) height_lookup: Duration,
+    pub(crate) admission_wait: Duration,
+    pub(crate) dispatch_wait: Duration,
+    pub(crate) chain_task: Duration,
+    pub(crate) completion_wait: Duration,
+    pub(crate) end_to_end: Duration,
+}
+
+#[derive(Default)]
 struct IbdPeerPipelineBench {
     bodies: u32,
     preparation_queue: Duration,
@@ -1658,6 +1670,10 @@ struct IbdPeerPipelineBench {
     max_chain_task: Duration,
     max_end_to_end: Duration,
     max_gate_waiters: usize,
+    height_lookup: Duration,
+    dispatch_wait: Duration,
+    completion_wait: Duration,
+    unaccounted: Duration,
 }
 
 pub(crate) enum OutboundEvictionAction {
@@ -2817,17 +2833,36 @@ impl Node {
 
     pub(crate) fn record_ibd_peer_pipeline(
         &self,
-        preparation_queue: Duration,
-        preparation_work: Duration,
-        admission_wait: Duration,
-        chain_task: Duration,
-        end_to_end: Duration,
+        timing: PeerBlockPipelineTiming,
         gate_waiters: usize,
+        in_initial_block_download: bool,
     ) {
-        if !self.chain.read().is_initial_block_download() {
+        if !in_initial_block_download {
             return;
         }
+        let PeerBlockPipelineTiming {
+            preparation_queue,
+            preparation_work,
+            height_lookup,
+            admission_wait,
+            dispatch_wait,
+            chain_task,
+            completion_wait,
+            end_to_end,
+        } = timing;
         let mut bench = self.ibd_peer_pipeline_bench.lock();
+        bench.height_lookup += height_lookup;
+        bench.dispatch_wait += dispatch_wait;
+        bench.completion_wait += completion_wait;
+        bench.unaccounted += end_to_end.saturating_sub(
+            preparation_queue
+                + preparation_work
+                + height_lookup
+                + admission_wait
+                + dispatch_wait
+                + chain_task
+                + completion_wait,
+        );
         bench.bodies = bench.bodies.saturating_add(1);
         bench.preparation_queue += preparation_queue;
         bench.preparation_work += preparation_work;
@@ -2861,6 +2896,10 @@ impl Node {
             max_chain_task_ms = bench.max_chain_task.as_secs_f64() * 1_000.0,
             max_end_to_end_ms = bench.max_end_to_end.as_secs_f64() * 1_000.0,
             max_gate_waiters = bench.max_gate_waiters,
+            height_lookup = bench.height_lookup.as_secs_f64(),
+            dispatch_wait = bench.dispatch_wait.as_secs_f64(),
+            completion_wait = bench.completion_wait.as_secs_f64(),
+            unaccounted = bench.unaccounted.as_secs_f64(),
             "IBD peer pipeline benchmark"
         );
     }
@@ -5326,7 +5365,9 @@ impl Node {
     }
 
     pub(crate) fn process_peer_block_availability(&self, peer_id: usize) {
-        let chain = self.chain.read();
+        let Some(chain) = self.chain.try_read() else {
+            return;
+        };
         let mut peers = self.peers.write();
         let Some(peer) = peers.get_mut(&peer_id) else {
             return;
@@ -5368,6 +5409,18 @@ impl Node {
             return false;
         };
         u64::from(header.time).saturating_add(24 * 60 * 60) >= time::unix_time()
+    }
+
+    pub(crate) fn try_best_header_is_recent(&self) -> Option<bool> {
+        let chain = self.chain.try_read()?;
+        let best_header = chain.best_header_tip();
+        Some(
+            chain
+                .header_by_hash(&best_header.hash)
+                .is_some_and(|header| {
+                    u64::from(header.time).saturating_add(24 * 60 * 60) >= time::unix_time()
+                }),
+        )
     }
 
     /// Claim the initial headers-sync slot for this connection.
@@ -5604,7 +5657,9 @@ impl Node {
             .copied()
             .unwrap_or_default();
         let (tip_hash, tip_work, peer_work, benchmark_work, benchmark_parent) = {
-            let chain = self.chain.read();
+            let Some(chain) = self.chain.try_read() else {
+                return OutboundEvictionAction::None;
+            };
             let tip = chain.tip();
             let peer_work = peer
                 .best_known_block
@@ -5967,9 +6022,17 @@ impl Node {
         self.track_peer_block_request_with_limit(peer_id, hash, true)
     }
 
-    pub(crate) fn track_ibd_peer_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
+    pub(crate) fn track_ibd_peer_block_request(
+        &self,
+        peer_id: usize,
+        hash: BlockHash,
+    ) -> Option<bool> {
         let capacity = self.peer_ibd_block_capacity(peer_id);
-        self.track_peer_block_request_with_capacity(peer_id, hash, true, capacity)
+        let chain = self.chain.try_read()?;
+        let Some(height) = chain.block_height_by_hash(&hash) else {
+            return Some(false);
+        };
+        Some(self.track_peer_block_request_at_height(peer_id, hash, height, true, capacity))
     }
 
     pub(crate) fn peer_ibd_block_capacity(&self, peer_id: usize) -> usize {
@@ -6131,12 +6194,23 @@ impl Node {
         enforce_limit: bool,
         capacity: usize,
     ) -> bool {
-        if self.peer_block_queue_hashes.lock().contains(&hash) {
-            return false;
-        }
         let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
             return false;
         };
+        self.track_peer_block_request_at_height(peer_id, hash, height, enforce_limit, capacity)
+    }
+
+    fn track_peer_block_request_at_height(
+        &self,
+        peer_id: usize,
+        hash: BlockHash,
+        height: u32,
+        enforce_limit: bool,
+        capacity: usize,
+    ) -> bool {
+        if self.peer_block_queue_hashes.lock().contains(&hash) {
+            return false;
+        }
         let mut peers = self.peers.write();
         if peers.values().any(|peer| {
             peer.inflight_blocks
@@ -6216,6 +6290,16 @@ impl Node {
                 .iter()
                 .any(|inflight| inflight.hash == hash)
         })
+    }
+
+    pub(crate) fn peer_block_request_height(&self, peer_id: usize, hash: BlockHash) -> Option<u32> {
+        self.peers
+            .read()
+            .get(&peer_id)?
+            .inflight_blocks
+            .iter()
+            .find(|inflight| inflight.hash == hash)
+            .map(|inflight| inflight.height)
     }
 
     pub(crate) fn block_request_in_flight(&self, hash: BlockHash) -> bool {
@@ -10695,10 +10779,16 @@ mod tests {
         assert_eq!(before.best_known_block, None);
         assert_eq!(before.last_unknown_block, Some(hash));
 
-        node.chain
-            .write()
+        let mut chain = node.chain.write();
+        chain
             .accept_headers(std::slice::from_ref(&block.header))
             .unwrap();
+        node.process_peer_block_availability(1);
+        assert_eq!(
+            node.peers.read().get(&1).unwrap().last_unknown_block,
+            Some(hash)
+        );
+        drop(chain);
         node.process_peer_block_availability(1);
 
         let after = node
@@ -11131,6 +11221,35 @@ mod tests {
         );
         assert_eq!(schedule.requests.len(), 1);
         assert_eq!(schedule.requests[0].hash, first.block_hash());
+    }
+
+    #[test]
+    fn ibd_scheduler_defers_chain_reads_while_validation_is_busy() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 3);
+        node.chain.write().accept_headers(&[first.header]).unwrap();
+        let hash = first.block_hash();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        node.update_peer_best_known_block(1, hash);
+        node.headers_sync_active.lock().insert(1);
+
+        let chain = node.chain.write();
+        assert_eq!(node.track_ibd_peer_block_request(1, hash), None);
+        assert_eq!(node.try_best_header_is_recent(), None);
+        assert!(matches!(
+            node.consider_outbound_eviction(1),
+            OutboundEvictionAction::None
+        ));
+        node.process_peer_block_availability(1);
+        node.record_ibd_peer_pipeline(PeerBlockPipelineTiming::default(), 0, true);
+        assert_eq!(node.ibd_peer_pipeline_bench.lock().bodies, 1);
+        drop(chain);
+
+        assert_eq!(node.track_ibd_peer_block_request(1, hash), Some(true));
+        assert_eq!(node.track_ibd_peer_block_request(1, hash), Some(false));
+        assert_eq!(node.peer_block_request_height(1, hash), Some(1));
     }
 
     #[test]

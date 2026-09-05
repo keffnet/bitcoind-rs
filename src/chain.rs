@@ -8219,16 +8219,18 @@ impl ChainState {
     /// descendants.  The body may have arrived before its parent, so only a
     /// parent on the active chain or an already-ready peer suffix can make
     /// this block scheduler-visible.
-    fn note_peer_body_chain_ready(&mut self, hash: BlockHash) {
+    fn note_peer_body_chain_ready(&mut self, hash: BlockHash) -> usize {
         let parent_ready = self
             .block_index
             .get(&hash)
             .is_some_and(|node| self.peer_body_parent_chain_ready(node.header.prev_blockhash));
         if !parent_ready && !self.is_active_block(&hash) {
-            return;
+            return 0;
         }
         let mut queue = VecDeque::from([hash]);
+        let mut visited = 0;
         while let Some(parent_hash) = queue.pop_front() {
+            visited += 1;
             if !self.is_active_block(&parent_hash) {
                 self.peer_body_chain_ready.insert(parent_hash);
             }
@@ -8241,11 +8243,13 @@ impl ChainState {
                         self.is_active_block(&node.header.prev_blockhash)
                             || self.peer_body_chain_ready.contains(&parent_hash)
                     })
+                    && self.peer_body_chain_ready.insert(child_hash)
                 {
                     queue.push_back(child_hash);
                 }
             }
         }
+        visited
     }
 
     /// Match Core's `HaveNumChainTxs` precondition for propagating an
@@ -18295,6 +18299,50 @@ mod tests {
         assert_eq!(state.height(), 5);
         assert_eq!(state.best_hash(), five.block_hash());
         assert!(state.pending_body_children.is_empty());
+    }
+
+    #[test]
+    fn peer_body_readiness_propagates_once_and_accepts_new_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let root = state.best_hash();
+        let mut previous = *state.header(0).unwrap();
+        let mut hashes = Vec::new();
+        for height in 1..=256 {
+            let block = mine_block_from_header(&previous, height, height as u8);
+            state.accept_headers(&[block.header]).unwrap();
+            state.store.insert_unsynced(&block).unwrap();
+            state
+                .pending_body_children
+                .entry(previous.block_hash())
+                .or_default()
+                .push(block.block_hash());
+            hashes.push(block.block_hash());
+            previous = block.header;
+        }
+        assert_eq!(state.note_peer_body_chain_ready(root), 257);
+        assert!(
+            hashes
+                .iter()
+                .all(|hash| state.peer_body_chain_ready.contains(hash))
+        );
+        let repeated_visits: usize = hashes
+            .iter()
+            .map(|hash| state.note_peer_body_chain_ready(*hash))
+            .sum();
+        assert_eq!(repeated_visits, 256);
+
+        let late = mine_block_from_header(&previous, 257, 1);
+        state.accept_headers(&[late.header]).unwrap();
+        state.store.insert_unsynced(&late).unwrap();
+        state
+            .pending_body_children
+            .entry(previous.block_hash())
+            .or_default()
+            .push(late.block_hash());
+        assert_eq!(state.note_peer_body_chain_ready(previous.block_hash()), 2);
+        assert!(state.peer_body_chain_ready.contains(&late.block_hash()));
+        assert_eq!(state.height(), 0);
     }
 
     #[test]

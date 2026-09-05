@@ -1962,11 +1962,7 @@ impl BlockStore {
         let bytes = prepared.encoded;
         let offset = self.block_data_len;
         let length = u32::try_from(bytes.len()).context("block length does not fit u32")?;
-        let mut record = Vec::with_capacity(4 + bytes.len());
-        record.extend_from_slice(&length.to_le_bytes());
-        record.extend_from_slice(&bytes);
-        self.xor_key.apply(&mut record, offset);
-        let record_len = u64::try_from(record.len()).context("block record length overflowed")?;
+        let record_len = u64::from(length) + 4;
         ensure_file_preallocated(
             &self.file,
             &mut self.block_preallocated_through,
@@ -1976,6 +1972,10 @@ impl BlockStore {
             &self.path,
         );
         if sync {
+            let mut record = Vec::with_capacity(4 + bytes.len());
+            record.extend_from_slice(&length.to_le_bytes());
+            record.extend_from_slice(&bytes);
+            self.xor_key.apply(&mut record, offset);
             self.file.write_all(&record)?;
             self.file.sync_data()?;
             persist_index_entry_with_sync(
@@ -1986,7 +1986,13 @@ impl BlockStore {
                 true,
             )?;
         } else {
-            self.pending_block_data.extend_from_slice(&record);
+            let start = self.pending_block_data.len();
+            self.pending_block_data.reserve(4 + bytes.len());
+            self.pending_block_data
+                .extend_from_slice(&length.to_le_bytes());
+            self.pending_block_data.extend_from_slice(&bytes);
+            self.xor_key
+                .apply(&mut self.pending_block_data[start..], offset);
             Self::append_unsynced_index_entry(
                 &mut self.pending_index_data,
                 hash,
@@ -9525,6 +9531,84 @@ mod tests {
         store.flush_pending_block_data().unwrap();
         assert!(reader.pending_blocks.read().is_empty());
         assert_eq!(reader.get(&hash).unwrap(), Some(block));
+    }
+
+    #[test]
+    fn buffered_block_frames_preserve_xor_offsets_across_mixed_appends() {
+        for xor in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = BlockStore::open_with_xor(directory.path(), xor).unwrap();
+            let mut expected = Vec::new();
+            let mut blocks = Vec::new();
+            for index in 0..8 {
+                let mut block = genesis_block(Network::Regtest);
+                block.header.nonce = index;
+                block.txdata[0].output[0].script_pubkey =
+                    bitcoin::ScriptBuf::from_bytes(vec![0x51; 100 + index as usize]);
+                let payload =
+                    encode_storage_payload(&serialize(&block), MAX_STORED_BLOCK_SIZE).unwrap();
+                expected.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                expected.extend_from_slice(&payload);
+                if index % 3 == 2 {
+                    store.insert(&block).unwrap();
+                } else {
+                    store.insert_unsynced(&block).unwrap();
+                }
+                assert_eq!(
+                    store.reader().get(&block.block_hash()).unwrap(),
+                    Some(block.clone())
+                );
+                blocks.push(block);
+            }
+            store.flush().unwrap();
+            let mut actual = std::fs::read(directory.path().join("blocks.dat")).unwrap();
+            store.xor_key.apply(&mut actual, 0);
+            assert_eq!(actual, expected);
+            drop(store);
+            let mut reopened = BlockStore::open_with_xor(directory.path(), xor).unwrap();
+            for block in blocks {
+                assert_eq!(reopened.get(&block.block_hash()).unwrap(), Some(block));
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_block_frames_survive_automatic_buffer_rollover() {
+        use rand::{RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut script = vec![0u8; APPEND_BUFFER_FLUSH_BYTES / 5 + 1];
+        rng.fill_bytes(&mut script);
+        for xor in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = BlockStore::open_with_xor(directory.path(), xor).unwrap();
+            let reader = store.reader();
+            let mut blocks = Vec::new();
+            let mut rolled_over = false;
+            for index in 0..7 {
+                let mut block = genesis_block(Network::Regtest);
+                block.header.nonce = index;
+                block.txdata[0].output[0].script_pubkey =
+                    bitcoin::ScriptBuf::from_bytes(script.clone());
+                store.insert_unsynced(&block).unwrap();
+                if store.pending_block_data.is_empty() {
+                    rolled_over = true;
+                    assert!(store.block_data_len >= APPEND_BUFFER_FLUSH_BYTES as u64);
+                }
+                assert_eq!(
+                    reader.get(&block.block_hash()).unwrap(),
+                    Some(block.clone())
+                );
+                blocks.push(block);
+            }
+            assert!(rolled_over);
+            assert!(!store.pending_block_data.is_empty());
+            store.flush().unwrap();
+            drop(store);
+            let mut reopened = BlockStore::open_with_xor(directory.path(), xor).unwrap();
+            for block in blocks {
+                assert_eq!(reopened.get(&block.block_hash()).unwrap(), Some(block));
+            }
+        }
     }
 
     #[test]
